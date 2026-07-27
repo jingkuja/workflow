@@ -1,0 +1,48 @@
+[build-system]
+requires = ["setuptools>=80.9.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "workflow-backend"
+version = "0.1.0"
+description = "新媒体内容制作工作流后台"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+  "alembic==1.16.5",
+  "fastapi==0.139.2",
+  "httpx==0.28.1",
+  "mcp==1.28.1",
+  "psycopg[binary]==3.2.10",
+  "pydantic-settings==2.14.2",
+  "python-dotenv==1.1.1",
+  "sqlalchemy==2.0.43",
+  "uvicorn[standard]==0.51.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest==9.1.1",
+  "pytest-asyncio==1.4.0",
+  "ruff==0.15.22",
+]
+
+[project.scripts]
+workflow-t0-smoke = "workflow.scripts.t0_smoke:main"
+workflow-t1-smoke = "workflow.scripts.t1_smoke:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+addopts = "-q"
+pythonpath = ["src"]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+extend-exclude = [".venv", "data", "output", "t0-artifacts", "tmp"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]

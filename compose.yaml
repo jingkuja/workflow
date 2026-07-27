@@ -1,0 +1,170 @@
+name: workflow
+
+x-app-common: &app-common
+  build:
+    context: .
+  env_file:
+    - .env
+  restart: unless-stopped
+  networks:
+    - workflow-internal
+  volumes:
+    - ./data/probes:/data/probes
+    - ./data/files:/data/files
+  depends_on:
+    db-migrate:
+      condition: service_completed_successfully
+  logging:
+    driver: json-file
+    options:
+      max-size: "20m"
+      max-file: "5"
+
+services:
+  reverse-proxy:
+    image: nginx:1.28.0-alpine
+    restart: unless-stopped
+    depends_on:
+      boss-mcp:
+        condition: service_healthy
+      employee-mcp:
+        condition: service_healthy
+      workflow-api:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+    networks:
+      - workflow-internal
+    volumes:
+      - ./deploy/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://127.0.0.1:8080/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    mem_limit: 256m
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+
+  postgres:
+    image: postgres:16.10-bookworm
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      PGDATA: /var/lib/postgresql/data/pgdata
+    networks:
+      - workflow-internal
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    mem_limit: 2g
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+
+  db-migrate:
+    build:
+      context: .
+    env_file:
+      - .env
+    command: ["alembic", "upgrade", "head"]
+    restart: "no"
+    networks:
+      - workflow-internal
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ./data/files:/data/files
+
+  boss-mcp:
+    <<: *app-common
+    command:
+      - uvicorn
+      - workflow.apps.boss_mcp:app
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health/live', timeout=2)"
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    # 本地 100 MB Base64 实测服务端 RSS 约 580 MiB，512 MiB 会有 OOM 风险。
+    mem_limit: 1g
+
+  employee-mcp:
+    <<: *app-common
+    command:
+      - uvicorn
+      - workflow.apps.employee_mcp:app
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health/live', timeout=2)"
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    # 员工入口同样需要接收成片，采用与老板入口相同的 T0 上限。
+    mem_limit: 1g
+
+  workflow-api:
+    <<: *app-common
+    command:
+      - uvicorn
+      - workflow.apps.workflow_api:app
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health/ready', timeout=2)"
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    mem_limit: 512m
+
+  workflow-worker:
+    <<: *app-common
+    command:
+      - python
+      - -m
+      - workflow.apps.worker
+    healthcheck:
+      test: ["CMD-SHELL", "test -r /proc/1/status"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    mem_limit: 1536m
+
+networks:
+  workflow-internal:
+    internal: false
+
+volumes:
+  postgres-data:

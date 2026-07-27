@@ -1,0 +1,16 @@
+.DS_Store
+.env
+.git
+.pytest_cache
+.ruff_cache
+.venv
+__pycache__
+*.pyc
+data
+backups
+docs
+logs
+output
+t0-artifacts
+tests
+tmp

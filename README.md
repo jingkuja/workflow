@@ -1,0 +1,111 @@
+# 新媒体内容制作工作流后台
+
+当前仓库已完成 T0 技术验证和 T1 工程与业务底座，提供：
+
+- 老板、员工两个独立的 Streamable HTTP MCP 入口。
+- 固定 Token 鉴权和不同工具白名单。
+- `.docx`、`.pdf`、`.md`、`.txt` 文件字段探针。
+- 最大约 100 MB Base64 视频分块解码与落盘探针。
+- 随机文件 ID 和可点击下载路由。
+- 企业微信群机器人 `userid` @探针，默认禁止真实发送。
+- Docker Compose、Nginx、健康检查、单元测试和联调脚本。
+- PostgreSQL 16、Alembic 迁移和 `.env` 人员同步（数据库只保存 Token 哈希）。
+- 首版业务模型、追加式审计、幂等请求指纹和 SQLAlchemy 乐观锁。
+- 支持租约、超时重领和递增重试的 PostgreSQL Worker。
+- 企业微信事务发件箱及事件去重、重试和 DEAD 状态。
+- `storage_provider + storage_key` 附件模型、本地原子落盘和磁盘阈值保护。
+- 数据库备份、隔离恢复脚本和 Docker 日志轮转。
+
+Word 导入、周均衡分配和演播稿提交审核从 T2 开始实现。
+
+## 本地启动
+
+```bash
+cp .env.example .env
+docker compose up --build -d
+docker compose ps
+```
+
+首次启动顺序为 PostgreSQL 健康检查 → `db-migrate` → API/MCP/Worker → Nginx。
+只有 Nginx 的 8080 端口暴露给宿主机。
+
+默认地址：
+
+- 老板 MCP：`http://localhost:8080/mcp/boss`
+- 员工 MCP：`http://localhost:8080/mcp/employee`
+- 反向代理健康检查：`http://localhost:8080/health`
+- 下载路由：`http://localhost:8080/files/{opaque_file_id}`
+
+`.env.example` 中的 Token 仅用于本机验证，部署前必须替换。
+部署到真实子域名时设置 `PUBLIC_BASE_URL=https://你的域名`，系统会自动把该
+域名加入 MCP Host/Origin 白名单；仅当前置网关改写了 `Host` 时，才需要把改写
+后的值追加到 `MCP_ALLOWED_HOSTS`。服务始终保留 MCP SDK 的 DNS 重绑定保护。
+
+WorkBuddy 应配置完整入口 `/mcp/boss` 或 `/mcp/employee`，不要使用 `/mcp`。
+
+## 开发与测试
+
+```bash
+make install
+make lint
+make test
+```
+
+T1 基础能力冒烟：
+
+```bash
+docker compose exec -T workflow-api python -m workflow.scripts.t1_smoke
+```
+
+数据库备份和隔离恢复：
+
+```bash
+scripts/backup_db.sh backups
+scripts/restore_db_test.sh backups/你的备份.dump workflow_restore_test
+```
+
+启动 Compose 后执行 MCP 冒烟：
+
+```bash
+set -a
+source .env
+set +a
+.venv/bin/python -m workflow.scripts.t0_smoke
+```
+
+附带 Word 文件探针：
+
+```bash
+.venv/bin/python -m workflow.scripts.t0_smoke \
+  --document "docs/AI行业选题文档上传样例.docx"
+```
+
+生成接近 100 MB 的本地 MP4 测试文件：
+
+```bash
+scripts/generate_t0_video.sh t0-artifacts/t0-100mb.mp4
+```
+
+然后执行大文件探针：
+
+```bash
+.venv/bin/python -m workflow.scripts.t0_smoke \
+  --video t0-artifacts/t0-100mb.mp4
+```
+
+大文件工具内部按块解码，避免同时保留第二份完整二进制内容；但 MCP SDK 和 JSON 解析层仍可能先把完整 Base64 字符串载入内存。必须使用真实 WorkBuddy 请求补做 T0 压测。
+
+## 企业微信验证
+
+在服务器 `.env` 配置：
+
+```dotenv
+MCP_BOSS_WECOM_USERID=老板userid
+MCP_EMPLOYEES_JSON='[{"name":"员工姓名","token":"随机Token","wecom_userid":"员工userid","active":true}]'
+WECOM_GROUP_WEBHOOK_URL=https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=...
+T0_ALLOW_WECOM_SEND=true
+```
+
+然后通过老板 MCP 调用 `t0_probe_wecom_mention`。默认值为 `false`，防止本地测试误发群通知。
+
+详细步骤和结果登记见 `docs/T0-技术验证与联调记录.md`。

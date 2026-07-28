@@ -1,6 +1,6 @@
 # 新媒体内容制作工作流后台
 
-当前仓库已完成 T0 技术验证和 T1 工程与业务底座，提供：
+当前仓库已完成 T0 技术验证、T1 工程底座和 T2 选题与演播稿闭环，提供：
 
 - 老板、员工两个独立的 Streamable HTTP MCP 入口。
 - 固定 Token 鉴权和不同工具白名单。
@@ -15,14 +15,17 @@
 - 企业微信事务发件箱及事件去重、重试和 DEAD 状态。
 - `storage_provider + storage_key` 附件模型、本地原子落盘和磁盘阈值保护。
 - 数据库备份、隔离恢复脚本和 Docker 日志轮转。
-
-Word 导入、周均衡分配和演播稿提交审核从 T2 开始实现。
+- 真实 Word 样例解析、SHA-256 批次去重和并发唯一导入。
+- 工作日生效规则、任务编号和按周工作量最小值随机分配。
+- 导入任务删除、改派、优先级以及老板/员工资源权限隔离。
+- `.docx`、`.pdf`、`.md`、`.txt` 演播稿多版本提交、驳回、重提和通过。
+- 追加式分配记录、审计日志和通知发件箱事件。
 
 ## 本地启动
 
 ```bash
 cp .env.example .env
-docker compose up --build -d
+make compose-up
 docker compose ps
 ```
 
@@ -56,6 +59,19 @@ T1 基础能力冒烟：
 ```bash
 docker compose exec -T workflow-api python -m workflow.scripts.t1_smoke
 ```
+
+T2 真实样例端到端冒烟：
+
+```bash
+set -a
+source .env
+set +a
+.venv/bin/python -m workflow.scripts.t2_smoke --concurrency-check
+```
+
+该命令通过真实老板/员工 MCP 入口验证：样例解析 10 条、并发导入只创建一个
+批次、哈希重复识别、员工本人权限、幂等提交，以及“提交 → 驳回 → 重提 →
+通过”闭环。详见 `docs/T2-选题与演播稿闭环验收记录.md`。
 
 数据库备份和隔离恢复：
 

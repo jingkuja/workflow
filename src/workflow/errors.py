@@ -23,3 +23,23 @@ class OptimisticLockConflict(WorkflowError):
 class DiskSpaceInsufficient(WorkflowError):
     code = "DISK_SPACE_INSUFFICIENT"
     status_code = 507
+
+
+class NotFound(WorkflowError):
+    code = "NOT_FOUND"
+    status_code = 404
+
+
+class Forbidden(WorkflowError):
+    code = "FORBIDDEN"
+    status_code = 403
+
+
+class InvalidStateTransition(WorkflowError):
+    code = "INVALID_STATE_TRANSITION"
+    status_code = 409
+
+
+class ValidationFailed(WorkflowError):
+    code = "VALIDATION_FAILED"
+    status_code = 422

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from enum import StrEnum
 from typing import Any
 
@@ -9,6 +9,7 @@ from sqlalchemy import (
     JSON,
     BigInteger,
     Boolean,
+    Date,
     DateTime,
     Enum,
     ForeignKey,
@@ -91,6 +92,9 @@ class ContentProject(TimestampMixin, Base):
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
     company_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    import_batch_id: Mapped[str | None] = mapped_column(ForeignKey("import_batches.id"))
+    source_sequence: Mapped[int | None] = mapped_column(Integer)
+    source_content: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
     title: Mapped[str] = mapped_column(String(500), nullable=False)
     status: Mapped[str] = mapped_column(String(64), nullable=False)
     version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
@@ -140,6 +144,8 @@ class TaskAssignment(Base):
     task_id: Mapped[str] = mapped_column(ForeignKey("stage_tasks.id"), nullable=False)
     assignee_id: Mapped[str] = mapped_column(ForeignKey("actor_profiles.id"), nullable=False)
     event_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    workload_delta: Mapped[int] = mapped_column(Integer, nullable=False)
+    work_week_start: Mapped[date] = mapped_column(Date, nullable=False)
     reason: Mapped[str | None] = mapped_column(Text)
     assigned_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
@@ -287,3 +293,10 @@ class Notification(TimestampMixin, Base):
     next_retry_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     response_summary: Mapped[str | None] = mapped_column(Text)
     sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class TaskNumberCounter(Base):
+    __tablename__ = "task_number_counters"
+
+    counter_date: Mapped[date] = mapped_column(Date, primary_key=True)
+    last_value: Mapped[int] = mapped_column(Integer, default=0, nullable=False)

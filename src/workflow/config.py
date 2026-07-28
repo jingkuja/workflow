@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Literal
 from urllib.parse import urlsplit
 
-from pydantic import Field, SecretStr, field_validator
+from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 Role = Literal["BOSS", "EMPLOYEE"]
@@ -23,7 +23,7 @@ class Actor:
 
 
 class Settings(BaseSettings):
-    """T0 配置。
+    """工作流应用配置。
 
     Token 只存在于进程内存，不写入探针元数据或日志。
     """
@@ -48,6 +48,8 @@ class Settings(BaseSettings):
     worker_lease_seconds: int = Field(default=60, ge=5)
     worker_max_attempts: int = Field(default=5, ge=1)
     notification_send_enabled: bool = False
+    workday_start_hour: int = Field(default=9, ge=0, le=23)
+    workday_end_hour: int = Field(default=18, ge=1, le=23)
     mcp_allowed_hosts: str = "localhost,localhost:*,127.0.0.1,127.0.0.1:*"
     mcp_allowed_origins: str = "http://localhost:*,http://127.0.0.1:*"
 
@@ -73,6 +75,12 @@ class Settings(BaseSettings):
         if not value.startswith(("http://", "https://")):
             raise ValueError("PUBLIC_BASE_URL 必须以 http:// 或 https:// 开头")
         return value
+
+    @model_validator(mode="after")
+    def validate_workday_hours(self) -> Settings:
+        if self.workday_end_hour <= self.workday_start_hour:
+            raise ValueError("WORKDAY_END_HOUR 必须晚于 WORKDAY_START_HOUR")
+        return self
 
     def actors(self) -> tuple[Actor, ...]:
         try:
@@ -112,7 +120,7 @@ class Settings(BaseSettings):
         if len(tokens) != len(set(tokens)):
             raise ValueError("每位人员必须使用不同 Token")
         if any(len(token) < 16 for token in tokens):
-            raise ValueError("T0 Token 至少需要 16 个字符")
+            raise ValueError("Token 至少需要 16 个字符")
         return tuple(actors)
 
     def token_registry(self) -> dict[str, Actor]:

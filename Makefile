@@ -20,7 +20,7 @@ format:
 	$(VENV_PYTHON) -m ruff format .
 
 compose-up:
-	docker compose up --build -d
+	docker compose up --build -d --force-recreate
 
 compose-down:
 	docker compose down

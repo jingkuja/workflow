@@ -13,6 +13,7 @@ def make_settings(tmp_path: Path) -> Settings:
         app_env="test",
         public_base_url="http://testserver",
         probe_data_dir=tmp_path,
+        file_data_dir=tmp_path / "files",
         mcp_boss_token=SecretStr("boss-token-at-least-16"),
         mcp_employees_json=(
             '[{"name":"员工甲","token":"employee-token-at-least-16","active":true}]'
@@ -37,3 +38,8 @@ def test_boss_and_employee_tool_whitelists_are_isolated(tmp_path: Path) -> None:
     assert "t0_boss_capability" not in employee_tools
     assert "t0_probe_wecom_mention" in boss_tools
     assert "t0_probe_wecom_mention" not in employee_tools
+    assert "import_topic_document" in boss_tools
+    assert "review_script_submission" in boss_tools
+    assert "submit_script_file" not in boss_tools
+    assert "submit_script_file" in employee_tools
+    assert "import_topic_document" not in employee_tools

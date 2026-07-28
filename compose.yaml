@@ -56,6 +56,10 @@ services:
       - .env
     environment:
       PGDATA: /var/lib/postgresql/data/pgdata
+    # 仅绑定回环地址，供开发机运行真实 PostgreSQL 集成测试（make test-pg）；
+    # 不对公网暴露，生产环境可删除该端口映射。
+    ports:
+      - "127.0.0.1:5432:5432"
     networks:
       - workflow-internal
     volumes:
@@ -89,6 +93,11 @@ services:
 
   boss-mcp:
     <<: *app-common
+    depends_on:
+      db-migrate:
+        condition: service_completed_successfully
+      workflow-api:
+        condition: service_healthy
     command:
       - uvicorn
       - workflow.apps.boss_mcp:app
@@ -110,6 +119,11 @@ services:
 
   employee-mcp:
     <<: *app-common
+    depends_on:
+      db-migrate:
+        condition: service_completed_successfully
+      workflow-api:
+        condition: service_healthy
     command:
       - uvicorn
       - workflow.apps.employee_mcp:app
@@ -147,7 +161,8 @@ services:
       interval: 10s
       timeout: 3s
       retries: 5
-    mem_limit: 512m
+    # 规格 §4.10：workflow-api 上限 1 GB；文档解码与内部转发均在 API 进程执行。
+    mem_limit: 1g
 
   workflow-worker:
     <<: *app-common

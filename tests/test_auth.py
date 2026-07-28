@@ -53,7 +53,12 @@ async def test_auth_accepts_matching_role() -> None:
     status, body = await invoke(app, "Bearer boss-token-at-least-16")
 
     assert status == 200
-    assert json.loads(body) == {"actor_name": "老板", "actor_role": "BOSS"}
+    assert json.loads(body) == {
+        "actor_name": "老板",
+        "actor_role": "BOSS",
+        # 原始凭据透传给内部工作流 API 做第二层校验。
+        "actor_token": "boss-token-at-least-16",
+    }
 
 
 @pytest.mark.asyncio

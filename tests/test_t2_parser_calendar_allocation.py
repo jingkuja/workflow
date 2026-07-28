@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from io import BytesIO
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+from docx import Document
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 from sqlalchemy.pool import StaticPool
@@ -17,12 +19,104 @@ from workflow.t2.parser import parse_topic_document
 def test_real_topic_sample_parses_exactly_ten_topics() -> None:
     content = Path("docs/AI行业选题文档上传样例.docx").read_bytes()
 
-    topics = parse_topic_document(content)
+    result = parse_topic_document(content)
 
-    assert len(topics) == 10
-    assert [topic.source_sequence for topic in topics] == list(range(1, 11))
-    assert topics[0].title.startswith("芯片公司先给客户50亿美元")
-    assert all("提词器口播正文" in "".join(topic.source_content["fields"]) for topic in topics)
+    assert len(result.topics) == 10
+    assert result.failures == []
+    assert [topic.source_sequence for topic in result.topics] == list(range(1, 11))
+    assert result.topics[0].title.startswith("芯片公司先给客户50亿美元")
+    assert all(topic.script for topic in result.topics)
+    assert all(
+        "506字" not in topic.script and "505字" not in topic.script for topic in result.topics
+    )
+
+
+def _build_docx(blocks: list[tuple[str, str] | tuple[str, str, list[list[str]]]]) -> bytes:
+    document = Document()
+    for block in blocks:
+        style, text = block[0], block[1]
+        if style == "TABLE":
+            rows = block[2]  # type: ignore[index]
+            table = document.add_table(rows=len(rows), cols=len(rows[0]))
+            for row, cells in zip(table.rows, rows, strict=True):
+                for cell, value in zip(row.cells, cells, strict=True):
+                    cell.text = value
+        else:
+            document.add_paragraph(text, style=style)
+    buffer = BytesIO()
+    document.save(buffer)
+    return buffer.getvalue()
+
+
+def test_missing_script_records_failure_detail() -> None:
+    content = _build_docx(
+        [
+            ("Heading 1", "01｜有正文"),
+            ("Normal", "主爆款标题：标题一"),
+            ("Heading 2", "提词器口播正文（正文汉字数：10字）"),
+            ("Normal", "这是口播正文。"),
+            ("Heading 1", "02｜缺正文"),
+            ("Normal", "主爆款标题：标题二"),
+        ]
+    )
+
+    result = parse_topic_document(content)
+
+    assert [topic.source_sequence for topic in result.topics] == [1]
+    assert len(result.failures) == 1
+    assert result.failures[0].source_sequence == 2
+    assert result.failures[0].heading_title == "缺正文"
+    assert "提词器口播正文" in result.failures[0].reason
+
+
+def test_fields_inside_tables_are_parsed_in_document_order() -> None:
+    content = _build_docx(
+        [
+            ("Heading 1", "01｜表格选题"),
+            ("TABLE", "", [["主爆款标题", "表格里的标题"], ["所属领域", "算力"]]),
+            ("Heading 2", "提词器口播正文（正文汉字数：8字）"),
+            ("TABLE", "", [["第一段口播正文。"], ["第二段口播正文。"]]),
+        ]
+    )
+
+    result = parse_topic_document(content)
+
+    assert result.failures == []
+    assert len(result.topics) == 1
+    topic = result.topics[0]
+    assert topic.title == "表格里的标题"
+    assert "第一段口播正文。" in topic.script
+    assert "第二段口播正文。" in topic.script
+
+
+def test_empty_document_reports_generic_failure() -> None:
+    content = _build_docx([("Normal", "没有任何选题的文档。")])
+
+    result = parse_topic_document(content)
+
+    assert result.topics == []
+    assert len(result.failures) == 1
+    assert "选题区块" in result.failures[0].reason
+
+
+def test_unnumbered_heading_stops_topic_block() -> None:
+    content = _build_docx(
+        [
+            ("Heading 1", "01｜唯一选题"),
+            ("Normal", "主爆款标题：标题"),
+            ("Heading 2", "提词器口播正文（正文汉字数：5字）"),
+            ("Normal", "口播正文。"),
+            ("Heading 1", "文末核验表"),
+            ("Normal", "主爆款标题：不应生成任务"),
+            ("Heading 2", "提词器口播正文（正文汉字数：5字）"),
+            ("Normal", "不应被解析。"),
+        ]
+    )
+
+    result = parse_topic_document(content)
+
+    assert len(result.topics) == 1
+    assert result.topics[0].source_sequence == 1
 
 
 def test_effective_started_at_business_boundaries() -> None:

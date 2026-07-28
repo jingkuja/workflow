@@ -1,28 +1,38 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any
 
 from mcp.server.fastmcp import Context, FastMCP
 from mcp.server.fastmcp.server import TransportSecuritySettings
 
+from workflow.apps.api_client import WorkflowApiClient
 from workflow.config import Role, Settings
 from workflow.probes.service import ProbeService
 from workflow.probes.wecom import send_wecom_probe
-from workflow.t2.service import T2Service, safe_call
 
 
-def _actor_name(context: Context) -> str:
+@dataclass(frozen=True, slots=True)
+class _Caller:
+    """MCP 入口第一层校验解析出的调用人与原始凭据。"""
+
+    name: str
+    token: str
+
+
+def _caller(context: Context) -> _Caller:
     request = context.request_context.request
     state = request.scope.get("state", {}) if request is not None else {}
     actor_name = state.get("actor_name")
-    if not actor_name:
+    actor_token = state.get("actor_token")
+    if not actor_name or not actor_token:
         raise RuntimeError("请求身份上下文缺失")
-    return str(actor_name)
+    return _Caller(name=str(actor_name), token=str(actor_token))
 
 
 def create_mcp_server(settings: Settings, role: Role) -> FastMCP:
     service = ProbeService(settings, role)
-    t2 = T2Service(settings)
+    api = WorkflowApiClient(settings.internal_api_base_url)
     server_name = "boss-workflow-mcp" if role == "BOSS" else "employee-workflow-mcp"
     mcp = FastMCP(
         server_name,
@@ -98,23 +108,25 @@ def create_mcp_server(settings: Settings, role: Role) -> FastMCP:
             content_base64: str | None = None,
             file_url: str | None = None,
         ) -> dict[str, Any]:
-            return safe_call(
-                lambda: t2.import_topics(
-                    actor_name=_actor_name(context),
-                    original_filename=original_filename,
-                    idempotency_key=idempotency_key,
-                    content_base64=content_base64,
-                    file_url=file_url,
-                )
+            return api.call(
+                "/internal/tools/import-topic-document",
+                token=_caller(context).token,
+                tool="import_topic_document",
+                payload={
+                    "original_filename": original_filename,
+                    "idempotency_key": idempotency_key,
+                    "content_base64": content_base64,
+                    "file_url": file_url,
+                },
             )
 
         @mcp.tool(name="list_import_batch_tasks", description="查询导入批次的最新任务列表。")
         def list_import_batch_tasks(import_batch_id: str, context: Context) -> dict[str, Any]:
-            return safe_call(
-                lambda: t2.list_batch(
-                    actor_name=_actor_name(context),
-                    import_batch_id=import_batch_id,
-                )
+            return api.call(
+                "/internal/tools/list-import-batch-tasks",
+                token=_caller(context).token,
+                tool="list_import_batch_tasks",
+                payload={"import_batch_id": import_batch_id},
             )
 
         @mcp.tool(name="delete_imported_task", description="软删除尚未提交的导入任务。")
@@ -124,13 +136,15 @@ def create_mcp_server(settings: Settings, role: Role) -> FastMCP:
             context: Context,
             reason: str | None = None,
         ) -> dict[str, Any]:
-            return safe_call(
-                lambda: t2.cancel_imported_task(
-                    actor_name=_actor_name(context),
-                    task_no=task_no,
-                    reason=reason,
-                    idempotency_key=idempotency_key,
-                )
+            return api.call(
+                "/internal/tools/delete-imported-task",
+                token=_caller(context).token,
+                tool="delete_imported_task",
+                payload={
+                    "task_no": task_no,
+                    "reason": reason,
+                    "idempotency_key": idempotency_key,
+                },
             )
 
         @mcp.tool(name="change_task_assignee", description="把任务改派给其他在岗员工。")
@@ -141,14 +155,16 @@ def create_mcp_server(settings: Settings, role: Role) -> FastMCP:
             context: Context,
             reason: str | None = None,
         ) -> dict[str, Any]:
-            return safe_call(
-                lambda: t2.reassign(
-                    actor_name=_actor_name(context),
-                    task_no=task_no,
-                    new_employee_id=new_employee_id,
-                    reason=reason,
-                    idempotency_key=idempotency_key,
-                )
+            return api.call(
+                "/internal/tools/change-task-assignee",
+                token=_caller(context).token,
+                tool="change_task_assignee",
+                payload={
+                    "task_no": task_no,
+                    "new_employee_id": new_employee_id,
+                    "reason": reason,
+                    "idempotency_key": idempotency_key,
+                },
             )
 
         @mcp.tool(name="set_task_priority", description="设置或取消任务优先处理标记。")
@@ -158,18 +174,24 @@ def create_mcp_server(settings: Settings, role: Role) -> FastMCP:
             idempotency_key: str,
             context: Context,
         ) -> dict[str, Any]:
-            return safe_call(
-                lambda: t2.set_priority(
-                    actor_name=_actor_name(context),
-                    task_no=task_no,
-                    priority=priority,
-                    idempotency_key=idempotency_key,
-                )
+            return api.call(
+                "/internal/tools/set-task-priority",
+                token=_caller(context).token,
+                tool="set_task_priority",
+                payload={
+                    "task_no": task_no,
+                    "priority": priority,
+                    "idempotency_key": idempotency_key,
+                },
             )
 
         @mcp.tool(name="list_employees", description="查询在岗员工及本周有效任务数。")
         def list_employees(context: Context) -> dict[str, Any]:
-            return safe_call(lambda: t2.list_employees(actor_name=_actor_name(context)))
+            return api.call(
+                "/internal/tools/list-employees",
+                token=_caller(context).token,
+                tool="list_employees",
+            )
 
         @mcp.tool(name="list_content_projects", description="查询内容项目及当前阶段。")
         def list_content_projects(
@@ -177,21 +199,29 @@ def create_mcp_server(settings: Settings, role: Role) -> FastMCP:
             status: str | None = None,
             limit: int = 50,
         ) -> dict[str, Any]:
-            return safe_call(
-                lambda: t2.list_projects(
-                    actor_name=_actor_name(context), status=status, limit=limit
-                )
+            return api.call(
+                "/internal/tools/list-content-projects",
+                token=_caller(context).token,
+                tool="list_content_projects",
+                payload={"status": status, "limit": limit},
             )
 
         @mcp.tool(name="get_content_project", description="查询项目、源文案和版本历史。")
         def get_content_project(task_no: str, context: Context) -> dict[str, Any]:
-            return safe_call(
-                lambda: t2.get_project(actor_name=_actor_name(context), task_no=task_no)
+            return api.call(
+                "/internal/tools/get-content-project",
+                token=_caller(context).token,
+                tool="get_content_project",
+                payload={"task_no": task_no},
             )
 
         @mcp.tool(name="list_pending_reviews", description="查询待老板审核的演播稿。")
         def list_pending_reviews(context: Context) -> dict[str, Any]:
-            return safe_call(lambda: t2.pending_reviews(actor_name=_actor_name(context)))
+            return api.call(
+                "/internal/tools/list-pending-reviews",
+                token=_caller(context).token,
+                tool="list_pending_reviews",
+            )
 
         @mcp.tool(name="review_script_submission", description="通过或驳回最新演播稿版本。")
         def review_script_submission(
@@ -202,15 +232,17 @@ def create_mcp_server(settings: Settings, role: Role) -> FastMCP:
             comment: str | None = None,
             reason_category: str | None = None,
         ) -> dict[str, Any]:
-            return safe_call(
-                lambda: t2.review_script(
-                    actor_name=_actor_name(context),
-                    task_no=task_no,
-                    decision=decision,
-                    comment=comment,
-                    reason_category=reason_category,
-                    idempotency_key=idempotency_key,
-                )
+            return api.call(
+                "/internal/tools/review-script-submission",
+                token=_caller(context).token,
+                tool="review_script_submission",
+                payload={
+                    "task_no": task_no,
+                    "decision": decision,
+                    "comment": comment,
+                    "reason_category": reason_category,
+                    "idempotency_key": idempotency_key,
+                },
             )
 
         @mcp.tool(
@@ -250,16 +282,20 @@ def create_mcp_server(settings: Settings, role: Role) -> FastMCP:
             status: str | None = None,
             limit: int = 50,
         ) -> dict[str, Any]:
-            return safe_call(
-                lambda: t2.list_my_tasks(
-                    actor_name=_actor_name(context), status=status, limit=limit
-                )
+            return api.call(
+                "/internal/tools/list-my-tasks",
+                token=_caller(context).token,
+                tool="list_my_tasks",
+                payload={"status": status, "limit": limit},
             )
 
         @mcp.tool(name="get_my_task", description="查询本人任务、源文案和审核历史。")
         def get_my_task(task_no: str, context: Context) -> dict[str, Any]:
-            return safe_call(
-                lambda: t2.get_my_task(actor_name=_actor_name(context), task_no=task_no)
+            return api.call(
+                "/internal/tools/get-my-task",
+                token=_caller(context).token,
+                tool="get_my_task",
+                payload={"task_no": task_no},
             )
 
         @mcp.tool(name="submit_script_file", description="提交本人演播稿文件进入老板审核。")
@@ -272,16 +308,18 @@ def create_mcp_server(settings: Settings, role: Role) -> FastMCP:
             file_url: str | None = None,
             note: str | None = None,
         ) -> dict[str, Any]:
-            return safe_call(
-                lambda: t2.submit_script(
-                    actor_name=_actor_name(context),
-                    task_no=task_no,
-                    original_filename=original_filename,
-                    idempotency_key=idempotency_key,
-                    content_base64=content_base64,
-                    file_url=file_url,
-                    note=note,
-                )
+            return api.call(
+                "/internal/tools/submit-script-file",
+                token=_caller(context).token,
+                tool="submit_script_file",
+                payload={
+                    "task_no": task_no,
+                    "original_filename": original_filename,
+                    "idempotency_key": idempotency_key,
+                    "content_base64": content_base64,
+                    "file_url": file_url,
+                    "note": note,
+                },
             )
 
         @mcp.tool(

@@ -12,17 +12,15 @@ from workflow.config import get_settings
 from workflow.db.session import create_engine_from_settings, make_session_factory, session_scope
 from workflow.identity import sync_actor_profiles
 from workflow.jobs import claim_job, fail_job, succeed_job
+from workflow.logging import configure_logging
 from workflow.notifications import (
     claim_notification,
     mark_notification_failed,
     mark_notification_sent,
 )
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='{"level":"%(levelname)s","service":"workflow-worker","message":"%(message)s"}',
-)
-logger = logging.getLogger(__name__)
+configure_logging("workflow-worker")
+logger = logging.getLogger("workflow.worker")
 
 
 def process_job(session: Session, worker_id: str) -> bool:
@@ -37,7 +35,20 @@ def process_job(session: Session, worker_id: str) -> bool:
             fail_job(job, f"未知任务类型: {job.job_type}", permanent=True)
     except Exception as exc:
         fail_job(job, str(exc))
-        logger.exception("job_failed id=%s type=%s", job.id, job.job_type)
+        logger.exception(
+            "job_failed",
+            extra={"job_id": job.id, "job_type": job.job_type, "attempts": job.attempts},
+        )
+    else:
+        logger.info(
+            "job_processed",
+            extra={
+                "job_id": job.id,
+                "job_type": job.job_type,
+                "result_code": job.status.value,
+                "attempts": job.attempts,
+            },
+        )
     return True
 
 
@@ -73,6 +84,15 @@ def process_notification(session: Session) -> bool:
         mark_notification_sent(item, "ok")
     except Exception as exc:
         mark_notification_failed(item, str(exc), max_attempts=settings.worker_max_attempts)
+        logger.exception(
+            "notification_failed",
+            extra={
+                "notification_id": item.id,
+                "template": item.template,
+                "result_code": item.status.value,
+                "attempts": item.attempts,
+            },
+        )
     return True
 
 
@@ -83,12 +103,17 @@ def main() -> None:
     worker_id = f"{socket.gethostname()}:{os.getpid()}"
     with session_scope(factory) as session:
         sync_actor_profiles(session, settings)
-    logger.info("worker_started id=%s", worker_id)
+    logger.info("worker_started", extra={"worker_id": worker_id})
     while True:
-        with session_scope(factory) as session:
-            processed = process_job(session, worker_id)
-            if not processed:
-                processed = process_notification(session)
+        try:
+            with session_scope(factory) as session:
+                processed = process_job(session, worker_id)
+                if not processed:
+                    processed = process_notification(session)
+        except Exception:
+            # 瞬时故障（如数据库连接中断）不应杀死 Worker 进程。
+            logger.exception("worker_iteration_failed")
+            processed = False
         if not processed:
             time.sleep(settings.worker_poll_seconds)
 

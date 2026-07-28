@@ -112,6 +112,7 @@ class ImportBatch(TimestampMixin, Base):
     parse_status: Mapped[str] = mapped_column(String(32), nullable=False)
     success_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     failure_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    parse_report: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
 
 
 class StageTask(TimestampMixin, Base):

@@ -47,6 +47,8 @@ class StaticBearerAuthMiddleware:
         scope.setdefault("state", {})
         scope["state"]["actor_name"] = actor.name
         scope["state"]["actor_role"] = actor.role
+        # 原始身份凭据透传给内部工作流 API 做第二层校验（规格 §3.1）。
+        scope["state"]["actor_token"] = token
         await self.app(scope, receive, send)
 
     @staticmethod

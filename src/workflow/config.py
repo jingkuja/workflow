@@ -38,6 +38,8 @@ class Settings(BaseSettings):
     app_env: Literal["development", "test", "production"] = "development"
     app_timezone: str = "Asia/Shanghai"
     public_base_url: str = "http://localhost:8080"
+    # MCP 入口调用内部工作流 API 的地址（规格 §3.1：MCP 不直连数据库）。
+    internal_api_base_url: str = "http://workflow-api:8000"
     probe_data_dir: Path = Path("/data/probes")
     file_data_dir: Path = Path("/data/files")
     database_url: str = "postgresql+psycopg://workflow:workflow@postgres:5432/workflow"

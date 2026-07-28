@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import io
+import logging
 import secrets
 import uuid
 from datetime import UTC, datetime
@@ -31,9 +32,9 @@ from workflow.db.models import (
 from workflow.db.session import create_engine_from_settings, make_session_factory, session_scope
 from workflow.errors import (
     Forbidden,
+    InvalidArgument,
     InvalidStateTransition,
-    NotFound,
-    ValidationFailed,
+    ResourceNotFound,
     WorkflowError,
 )
 from workflow.idempotency import replay_or_none, save_response
@@ -50,6 +51,8 @@ from workflow.t2.parser import TopicParseError, parse_topic_document
 
 TOPIC_EXTENSIONS = {".docx"}
 SCRIPT_EXTENSIONS = {".docx", ".pdf", ".md", ".txt"}
+
+logger = logging.getLogger("workflow.t2")
 
 
 class T2Service:
@@ -77,9 +80,18 @@ class T2Service:
         )
         sha256 = hashlib.sha256(content).hexdigest()
         try:
-            topics = parse_topic_document(content)
+            parse_result = parse_topic_document(content)
         except TopicParseError as exc:
-            raise ValidationFailed(str(exc)) from exc
+            raise InvalidArgument(str(exc)) from exc
+        topics = parse_result.topics
+        failure_report = [
+            {
+                "source_sequence": failure.source_sequence,
+                "heading_title": failure.heading_title,
+                "reason": failure.reason,
+            }
+            for failure in parse_result.failures
+        ]
         with session_scope(self.sessions) as session:
             actor = self._actor(session, actor_name, Role.BOSS)
             replay = self._replay(
@@ -100,7 +112,7 @@ class T2Service:
             )
             if existing is not None:
                 response = self._import_response(session, existing, True, 0)
-                self._save_idempotency(
+                replayed = self._save_idempotency(
                     session,
                     actor,
                     "import_topic_document",
@@ -108,7 +120,7 @@ class T2Service:
                     {"filename": original_filename, "sha256": sha256},
                     response,
                 )
-                return response
+                return replayed if replayed is not None else response
 
             now = datetime.now(UTC)
             attachment = self._store_attachment(
@@ -123,6 +135,7 @@ class T2Service:
                 source_attachment_id=attachment.id,
                 sha256=sha256,
                 parse_status="PROCESSING",
+                parse_report={"failures": failure_report},
             )
             session.add(batch)
             session.flush()
@@ -140,11 +153,14 @@ class T2Service:
                 ),
             )
             created = 0
+            pending_assignment = 0
             for topic in topics:
                 loads = employee_loads(
                     session, actor.company_id, effective, self.settings.app_timezone
                 )
-                assignee = choose_employee(loads)
+                # 规格 §4.3：暂时没有可用员工时任务进入 PENDING_ASSIGNMENT，
+                # 不阻断整批导入；老板可稍后通过改派指定负责人。
+                assignee = choose_employee(loads) if loads else None
                 project = ContentProject(
                     company_id=actor.company_id,
                     import_batch_id=batch.id,
@@ -160,53 +176,69 @@ class T2Service:
                     project_id=project.id,
                     task_no=next_task_number(session, now, self.settings.app_timezone),
                     task_type="SCRIPT",
-                    status="IN_PROGRESS",
-                    assignee_id=assignee.id,
+                    status="IN_PROGRESS" if assignee else "PENDING_ASSIGNMENT",
+                    assignee_id=assignee.id if assignee else None,
                     effective_started_at=effective,
                 )
                 session.add(task)
                 session.flush()
-                session.add(
-                    TaskAssignment(
-                        company_id=actor.company_id,
-                        task_id=task.id,
-                        assignee_id=assignee.id,
-                        event_type="AUTO_ASSIGNED",
-                        workload_delta=1,
-                        work_week_start=week_start_for(effective, self.settings.app_timezone),
-                        reason="选题导入自动分配",
-                        assigned_at=now,
+                if assignee is not None:
+                    session.add(
+                        TaskAssignment(
+                            company_id=actor.company_id,
+                            task_id=task.id,
+                            assignee_id=assignee.id,
+                            event_type="AUTO_ASSIGNED",
+                            workload_delta=1,
+                            work_week_start=week_start_for(
+                                effective, self.settings.app_timezone
+                            ),
+                            reason="选题导入自动分配",
+                            assigned_at=now,
+                        )
                     )
-                )
+                    self._notify(
+                        session,
+                        actor.company_id,
+                        "TASK_CREATED",
+                        f"新任务 {task.task_no}：{project.title}",
+                        [assignee.wecom_userid],
+                    )
+                else:
+                    pending_assignment += 1
                 self._audit(
                     session,
                     actor,
                     "SCRIPT_TASK_CREATED",
                     "stage_task",
                     task.id,
-                    {"task_no": task.task_no, "assignee_id": assignee.id},
-                )
-                self._notify(
-                    session,
-                    actor.company_id,
-                    "TASK_CREATED",
-                    f"新任务 {task.task_no}：{project.title}",
-                    [assignee.wecom_userid],
+                    {
+                        "task_no": task.task_no,
+                        "assignee_id": assignee.id if assignee else None,
+                        "status": task.status,
+                    },
                 )
                 created += 1
             batch.success_count = created
-            batch.failure_count = max(0, len(topics) - created)
-            batch.parse_status = "COMPLETED"
+            batch.failure_count = len(failure_report)
+            batch.parse_status = (
+                "COMPLETED" if not failure_report else "PARTIAL_SUCCESS"
+            ) if topics else "FAILED"
             self._audit(
                 session,
                 actor,
                 "TOPIC_BATCH_IMPORTED",
                 "import_batch",
                 batch.id,
-                {"created_count": created, "sha256": sha256},
+                {
+                    "created_count": created,
+                    "failure_count": len(failure_report),
+                    "pending_assignment_count": pending_assignment,
+                    "sha256": sha256,
+                },
             )
             response = self._import_response(session, batch, False, created)
-            self._save_idempotency(
+            replayed = self._save_idempotency(
                 session,
                 actor,
                 "import_topic_document",
@@ -214,7 +246,7 @@ class T2Service:
                 {"filename": original_filename, "sha256": sha256},
                 response,
             )
-            return response
+            return replayed if replayed is not None else response
 
     def list_batch(self, *, actor_name: str, import_batch_id: str) -> dict[str, Any]:
         with session_scope(self.sessions) as session:
@@ -240,9 +272,12 @@ class T2Service:
             if task.task_type != "SCRIPT" or task.status not in {
                 "IN_PROGRESS",
                 "REJECTED",
+                "PENDING_ASSIGNMENT",
             }:
                 raise InvalidStateTransition("该任务已提交或进入后续阶段，不能从导入列表删除。")
-            previous_assignee = session.get(ActorProfile, task.assignee_id)
+            previous_assignee = (
+                session.get(ActorProfile, task.assignee_id) if task.assignee_id else None
+            )
             now = datetime.now(UTC)
             before = {"status": task.status, "assignee_id": task.assignee_id}
             task.status = "CANCELLED"
@@ -279,9 +314,20 @@ class T2Service:
                 f"任务 {task.task_no} 已取消",
                 [previous_assignee.wecom_userid if previous_assignee else None],
             )
-            batch = session.get(ImportBatch, project.import_batch_id)
-            response = self._import_response(session, batch, True, 0)
-            self._save_idempotency(
+            batch = (
+                session.get(ImportBatch, project.import_batch_id)
+                if project.import_batch_id
+                else None
+            )
+            if batch is not None:
+                response: dict[str, Any] = self._import_response(session, batch, True, 0)
+            else:
+                response = {
+                    "success": True,
+                    "data": self._task_dict(session, task),
+                    "user_message": "任务已取消。",
+                }
+            replayed = self._save_idempotency(
                 session,
                 actor,
                 "delete_imported_task",
@@ -289,7 +335,7 @@ class T2Service:
                 payload,
                 response,
             )
-            return response
+            return replayed if replayed is not None else response
 
     def reassign(
         self,
@@ -322,10 +368,10 @@ class T2Service:
                 )
             )
             if employee is None:
-                raise ValidationFailed("新负责人不是有效的在岗员工。")
+                raise InvalidArgument("新负责人不是有效的在岗员工。")
             if employee.id == task.assignee_id:
-                raise ValidationFailed("新负责人与当前负责人相同。")
-            previous = session.get(ActorProfile, task.assignee_id)
+                raise InvalidArgument("新负责人与当前负责人相同。")
+            previous = session.get(ActorProfile, task.assignee_id) if task.assignee_id else None
             now = datetime.now(UTC)
             if previous is not None and self._before_effective(task, now):
                 session.add(
@@ -350,7 +396,11 @@ class T2Service:
                     assignee_id=employee.id,
                     event_type="MANUAL_REASSIGNED",
                     workload_delta=1,
-                    work_week_start=week_start_for(now, self.settings.app_timezone),
+                    # 与原始分配和抵消事件使用同一口径（effective_started_at 所在周），
+                    # 避免跨周改派时新员工的 +1 落入错误的周。
+                    work_week_start=week_start_for(
+                        task.effective_started_at or now, self.settings.app_timezone
+                    ),
                     reason=reason,
                     assigned_at=now,
                 )
@@ -377,9 +427,20 @@ class T2Service:
                     employee.wecom_userid,
                 ],
             )
-            batch = session.get(ImportBatch, project.import_batch_id)
-            response = self._import_response(session, batch, True, 0)
-            self._save_idempotency(
+            batch = (
+                session.get(ImportBatch, project.import_batch_id)
+                if project.import_batch_id
+                else None
+            )
+            if batch is not None:
+                response = self._import_response(session, batch, True, 0)
+            else:
+                response = {
+                    "success": True,
+                    "data": self._task_dict(session, task),
+                    "user_message": f"任务已改派给 {employee.display_name}。",
+                }
+            replayed = self._save_idempotency(
                 session,
                 actor,
                 "change_task_assignee",
@@ -387,7 +448,7 @@ class T2Service:
                 payload,
                 response,
             )
-            return response
+            return replayed if replayed is not None else response
 
     def set_priority(
         self,
@@ -420,7 +481,7 @@ class T2Service:
                 "data": self._task_dict(session, task),
                 "user_message": "任务优先级已更新。",
             }
-            self._save_idempotency(
+            replayed = self._save_idempotency(
                 session,
                 actor,
                 "set_task_priority",
@@ -428,7 +489,7 @@ class T2Service:
                 payload,
                 response,
             )
-            return response
+            return replayed if replayed is not None else response
 
     def list_employees(self, *, actor_name: str) -> dict[str, Any]:
         with session_scope(self.sessions) as session:
@@ -517,7 +578,7 @@ class T2Service:
                 )
             )
             if task is None:
-                raise NotFound("任务不存在或不属于当前员工。")
+                raise ResourceNotFound("任务不存在或不属于当前员工。")
             project = session.get(ContentProject, task.project_id)
             return {
                 "success": True,
@@ -565,7 +626,7 @@ class T2Service:
                 .with_for_update()
             )
             if task is None:
-                raise NotFound("任务不存在或不属于当前员工。")
+                raise ResourceNotFound("任务不存在或不属于当前员工。")
             if task.task_type != "SCRIPT" or task.status not in {
                 "IN_PROGRESS",
                 "REJECTED",
@@ -625,7 +686,7 @@ class T2Service:
                 },
                 "user_message": "演播稿已提交，等待老板审核。",
             }
-            self._save_idempotency(
+            replayed = self._save_idempotency(
                 session,
                 actor,
                 "submit_script_file",
@@ -633,7 +694,7 @@ class T2Service:
                 payload,
                 response,
             )
-            return response
+            return replayed if replayed is not None else response
 
     def pending_reviews(self, *, actor_name: str) -> dict[str, Any]:
         with session_scope(self.sessions) as session:
@@ -665,9 +726,9 @@ class T2Service:
     ) -> dict[str, Any]:
         decision = decision.upper()
         if decision not in {"APPROVED", "REJECTED"}:
-            raise ValidationFailed("decision 必须是 APPROVED 或 REJECTED。")
+            raise InvalidArgument("decision 必须是 APPROVED 或 REJECTED。")
         if decision == "REJECTED" and not (comment or "").strip():
-            raise ValidationFailed("驳回时必须填写修改意见。")
+            raise InvalidArgument("驳回时必须填写修改意见。")
         payload = {
             "task_no": task_no,
             "decision": decision,
@@ -718,7 +779,9 @@ class T2Service:
                     "comment": comment,
                 },
             )
-            assignee = session.get(ActorProfile, task.assignee_id)
+            assignee = (
+                session.get(ActorProfile, task.assignee_id) if task.assignee_id else None
+            )
             self._notify(
                 session,
                 actor.company_id,
@@ -738,7 +801,7 @@ class T2Service:
                 if decision == "APPROVED"
                 else "演播稿已驳回，原员工可修改后重提。",
             }
-            self._save_idempotency(
+            replayed = self._save_idempotency(
                 session,
                 actor,
                 "review_script_submission",
@@ -746,7 +809,7 @@ class T2Service:
                 payload,
                 response,
             )
-            return response
+            return replayed if replayed is not None else response
 
     def _actor(self, session: Session, name: str, role: Role) -> ActorProfile:
         actor = session.scalar(
@@ -781,7 +844,7 @@ class T2Service:
             )
         )
         if batch is None:
-            raise NotFound("导入批次不存在。")
+            raise ResourceNotFound("导入批次不存在。")
         return batch
 
     def _task_project(
@@ -800,10 +863,10 @@ class T2Service:
             query = query.with_for_update()
         task = session.scalar(query)
         if task is None:
-            raise NotFound("任务不存在。")
+            raise ResourceNotFound("任务不存在。")
         project = session.get(ContentProject, task.project_id)
         if project is None:
-            raise NotFound("内容项目不存在。")
+            raise ResourceNotFound("内容项目不存在。")
         return task, project
 
     def _store_attachment(
@@ -848,7 +911,7 @@ class T2Service:
         created_count: int,
     ) -> dict[str, Any]:
         if batch is None:
-            raise NotFound("导入批次不存在。")
+            raise ResourceNotFound("导入批次不存在。")
         projects = session.scalars(
             select(ContentProject)
             .where(ContentProject.import_batch_id == batch.id)
@@ -856,10 +919,13 @@ class T2Service:
         ).all()
         tasks: list[dict[str, Any]] = []
         duplicate_title_warnings: list[str] = []
+        pending_assignment_count = 0
         for project in projects:
             task = session.scalar(select(StageTask).where(StageTask.project_id == project.id))
             if task is not None:
                 tasks.append(self._task_dict(session, task))
+                if task.status == "PENDING_ASSIGNMENT":
+                    pending_assignment_count += 1
             duplicate_exists = session.scalar(
                 select(ContentProject.id)
                 .where(
@@ -872,26 +938,36 @@ class T2Service:
             )
             if duplicate_exists is not None:
                 duplicate_title_warnings.append(project.title)
+        failures = list((batch.parse_report or {}).get("failures", []))
+        if deduplicated:
+            user_message = "检测到相同文件，未重复创建任务。"
+        elif batch.parse_status == "FAILED":
+            user_message = "文档未解析出有效选题，未创建任务，请检查失败明细。"
+        else:
+            user_message = f"已从 Word 文档创建 {created_count} 个演播稿任务。"
+            if pending_assignment_count:
+                user_message += f"其中 {pending_assignment_count} 条待分配，请改派负责人。"
+            if failures:
+                user_message += f"另有 {len(failures)} 条选题解析失败。"
         return {
             "success": True,
             "data": {
                 "import_batch_id": batch.id,
                 "deduplicated": deduplicated,
                 "created_count": created_count,
+                "parse_status": batch.parse_status,
+                "pending_assignment_count": pending_assignment_count,
+                "failures": failures,
                 "tasks": tasks,
                 "duplicate_title_warnings": duplicate_title_warnings,
             },
-            "user_message": (
-                "检测到相同文件，未重复创建任务。"
-                if deduplicated
-                else f"已从 Word 文档创建并分配 {created_count} 个演播稿任务。"
-            ),
+            "user_message": user_message,
             "next_actions": ["浏览全部任务", "删除单个任务", "更换任务员工"],
         }
 
     def _task_dict(self, session: Session, task: StageTask) -> dict[str, Any]:
         project = session.get(ContentProject, task.project_id)
-        assignee = session.get(ActorProfile, task.assignee_id)
+        assignee = session.get(ActorProfile, task.assignee_id) if task.assignee_id else None
         return {
             "task_no": task.task_no,
             "title": project.title if project else "",
@@ -993,8 +1069,8 @@ class T2Service:
         key: str,
         payload: dict[str, Any],
         response: dict[str, Any],
-    ) -> None:
-        save_response(
+    ) -> dict[str, Any] | None:
+        return save_response(
             session,
             company_id=actor.company_id,
             actor_id=actor.id,
@@ -1044,15 +1120,23 @@ class T2Service:
         )
 
 
-def safe_call(call: Any) -> dict[str, Any]:
+def safe_call(call: Any, *, tool: str = "") -> dict[str, Any]:
     try:
         return call()
     except WorkflowError as exc:
+        logger.info(
+            "tool_rejected",
+            extra={"tool_name": tool, "result_code": exc.code},
+        )
         return {
             "success": False,
             "error": {"code": exc.code, "message": exc.message},
         }
     except Exception:
+        logger.exception(
+            "tool_failed",
+            extra={"tool_name": tool, "result_code": "INTERNAL_ERROR"},
+        )
         return {
             "success": False,
             "error": {

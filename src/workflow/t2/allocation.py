@@ -15,6 +15,7 @@ from workflow.db.models import (
     TaskAssignment,
     TaskNumberCounter,
 )
+from workflow.errors import NoEligibleAssignee
 from workflow.t2.calendar import week_start_for
 
 
@@ -74,7 +75,7 @@ def choose_employee(
     chooser: Callable[[list[ActorProfile]], ActorProfile] = secrets.choice,
 ) -> ActorProfile:
     if not loads:
-        raise ValueError("当前没有可分配的在岗新媒体运营员工。")
+        raise NoEligibleAssignee("当前没有可分配的在岗新媒体运营员工。")
     minimum = min(count for _, count in loads)
     candidates = [employee for employee, count in loads if count == minimum]
     return chooser(candidates)

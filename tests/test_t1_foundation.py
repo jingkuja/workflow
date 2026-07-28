@@ -104,6 +104,45 @@ def test_idempotency_replays_and_rejects_fingerprint_conflict(engine) -> None:
             )
 
 
+def test_idempotency_duplicate_save_replays_first_response(engine) -> None:
+    with Session(engine) as session:
+        actor = sync_actor_profiles(session, settings())[0]
+        session.flush()
+        first = save_response(
+            session,
+            company_id=actor.company_id,
+            actor_id=actor.id,
+            tool="probe",
+            key="race-key",
+            payload={"value": "A"},
+            response={"success": True, "nonce": "first"},
+        )
+        assert first is None
+        session.commit()
+
+        # 模拟并发下唯一约束冲突：第二个保存必须回退为重放首次响应。
+        second = save_response(
+            session,
+            company_id=actor.company_id,
+            actor_id=actor.id,
+            tool="probe",
+            key="race-key",
+            payload={"value": "A"},
+            response={"success": True, "nonce": "second"},
+        )
+        assert second == {"success": True, "nonce": "first"}
+        with pytest.raises(IdempotencyConflict):
+            save_response(
+                session,
+                company_id=actor.company_id,
+                actor_id=actor.id,
+                tool="probe",
+                key="race-key",
+                payload={"value": "B"},
+                response={"success": True},
+            )
+
+
 def test_worker_reclaims_expired_lease_and_retries(engine) -> None:
     expired = datetime.now(UTC) - timedelta(seconds=1)
     with Session(engine) as session:

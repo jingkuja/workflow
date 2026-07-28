@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import BinaryIO
 
-from workflow.errors import DiskSpaceInsufficient
+from workflow.errors import InsufficientStorage
 
 
 @dataclass(frozen=True, slots=True)
@@ -34,7 +34,7 @@ class LocalStorage:
 
     def ensure_capacity(self) -> None:
         if self.free_percent() < self.reject_percent:
-            raise DiskSpaceInsufficient("磁盘剩余空间低于安全阈值，暂不接收本地文件。")
+            raise InsufficientStorage("磁盘剩余空间低于安全阈值，暂不接收本地文件。")
 
     def put(
         self, stream: BinaryIO, *, company_id: str, purpose: str, attachment_id: str

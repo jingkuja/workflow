@@ -84,6 +84,27 @@ def test_structured_import_accepts_arbitrary_word_layout_and_deduplicates(tmp_pa
     assert duplicate["data"]["deduplicated"] is True
     assert duplicate["data"]["created_count"] == 0
 
+    changed_extraction = service.import_structured_topics(
+        actor_name="老板测试",
+        original_filename="还是同一个原文件.docx",
+        idempotency_key="structured-import-0003",
+        topics=[
+            StructuredTopicInput(
+                title="同一文件重新提取的新任务",
+                source_text="MCP 重新整理后的任务内容。",
+                script=None,
+                confidence=0.5,
+                evidence=[],
+            )
+        ],
+        warnings=[],
+        schema_version="1.0",
+        content_base64=encoded,
+        file_url=None,
+    )
+    assert changed_extraction["data"]["deduplicated"] is False
+    assert changed_extraction["data"]["created_count"] == 1
+
 
 def test_structured_import_trusts_mcp_content_without_source_verification(tmp_path) -> None:
     service = make_service(tmp_path)

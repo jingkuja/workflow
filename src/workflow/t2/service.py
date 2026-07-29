@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import io
+import json
 import logging
 import secrets
 import uuid
@@ -149,7 +150,7 @@ class T2Service:
             content_base64=content_base64,
             file_url=file_url,
         )
-        sha256 = hashlib.sha256(content).hexdigest()
+        source_sha256 = hashlib.sha256(content).hexdigest()
         prepared_topics = [
             _ImportTopic(
                 source_sequence=ordinal,
@@ -168,13 +169,27 @@ class T2Service:
         ]
 
         request_topics = [topic.model_dump(mode="json") for topic in topics]
+        # 结构化导入的任务事实由 MCP 结果决定。同一原文件可能被重新抽取为不同
+        # 任务集合，因此批次去重必须同时包含文件内容和结构化任务，而不能只看文件。
+        batch_sha256 = hashlib.sha256(
+            json.dumps(
+                {
+                    "source_sha256": source_sha256,
+                    "schema_version": schema_version,
+                    "topics": request_topics,
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+        ).hexdigest()
         return self._persist_topic_import(
             actor_name=actor_name,
             tool_name="import_structured_topics",
             original_filename=original_filename,
             idempotency_key=idempotency_key,
             content=content,
-            sha256=sha256,
+            sha256=batch_sha256,
             topics=prepared_topics,
             parse_report={
                 "import_mode": "WORKBUDDY_STRUCTURED",
@@ -182,11 +197,13 @@ class T2Service:
                 "warnings": warnings,
                 "failures": [],
                 "source_verification": "SKIPPED",
+                "source_sha256": source_sha256,
                 "topic_count": len(prepared_topics),
             },
             request_payload={
                 "filename": original_filename,
-                "sha256": sha256,
+                "source_sha256": source_sha256,
+                "batch_sha256": batch_sha256,
                 "schema_version": schema_version,
                 "topics": request_topics,
                 "warnings": warnings,

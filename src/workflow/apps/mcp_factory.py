@@ -132,6 +132,8 @@ def create_mcp_server(settings: Settings, role: Role) -> FastMCP:
                 "向老板展示提取预览并确认后调用。title 可概括；source_text、script "
                 "和 evidence 由 WorkBuddy 生成，缺少成稿时 script 传 null。"
                 "服务信任 MCP 结果并直接入库，同时保存源文件、去重并自动均衡分配。"
+                "调用完成后必须以工具返回的 created_count、deduplicated 和 tasks 为准，"
+                "不得用调用前 topics 数量自行宣称导入成功。"
             ),
         )
         def import_structured_topics(

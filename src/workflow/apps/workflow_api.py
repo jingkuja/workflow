@@ -1,19 +1,22 @@
 from __future__ import annotations
 
+import json
 import logging
 import secrets
 import time
 import uuid
 from collections.abc import Iterator
 from contextlib import asynccontextmanager
+from datetime import datetime
 from typing import Annotated, Any
 
-from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy import func, select, text
 from sqlalchemy.orm import Session
+from sqlalchemy.orm.exc import StaleDataError
 
 from workflow import __version__
 from workflow.config import get_settings
@@ -36,6 +39,7 @@ from workflow.idempotency import replay_or_none, save_response
 from workflow.identity import find_actor_by_token, sync_actor_profiles
 from workflow.logging import configure_logging
 from workflow.probes.storage import ProbeStorage
+from workflow.request_context import reset_request_id, set_request_id
 from workflow.storage import LocalStorage
 from workflow.t2.service import T2Service
 
@@ -85,19 +89,56 @@ class RequestLogMiddleware:
         )
         started = time.perf_counter()
         status_code = 0
+        start_message: dict[str, Any] | None = None
+        json_response = False
+        body_parts: list[bytes] = []
+        context_token = set_request_id(request_id)
 
         async def send_with_request_id(message: dict[str, Any]) -> None:
-            nonlocal status_code
+            nonlocal json_response, start_message, status_code
             if message["type"] == "http.response.start":
                 status_code = message["status"]
-                message.setdefault("headers", []).append(
-                    (b"x-request-id", request_id.encode("latin-1"))
+                headers = [
+                    item for item in message.setdefault("headers", []) if item[0] != b"x-request-id"
+                ]
+                headers.append((b"x-request-id", request_id.encode("latin-1")))
+                message["headers"] = headers
+                json_response = any(
+                    name == b"content-type" and value.startswith(b"application/json")
+                    for name, value in headers
                 )
+                if json_response:
+                    start_message = message
+                    return
+            elif message["type"] == "http.response.body" and json_response:
+                body_parts.append(message.get("body", b""))
+                if message.get("more_body", False):
+                    return
+                body = b"".join(body_parts)
+                try:
+                    payload = json.loads(body)
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    payload = None
+                if isinstance(payload, dict):
+                    payload.setdefault("request_id", request_id)
+                    body = json.dumps(
+                        payload, ensure_ascii=False, separators=(",", ":")
+                    ).encode()
+                assert start_message is not None
+                start_message["headers"] = [
+                    item
+                    for item in start_message["headers"]
+                    if item[0] != b"content-length"
+                ] + [(b"content-length", str(len(body)).encode("ascii"))]
+                await send(start_message)
+                await send({"type": "http.response.body", "body": body})
+                return
             await send(message)
 
         try:
             await self.app(scope, receive, send_with_request_id)
         finally:
+            reset_request_id(context_token)
             logger.info(
                 "http_request",
                 extra={
@@ -110,11 +151,31 @@ class RequestLogMiddleware:
             )
 
 
+_REMEDIATIONS = {
+    "UNAUTHENTICATED": "检查 Bearer Token 是否存在、有效且未被撤销。",
+    "FORBIDDEN": "使用具备该工具权限的入口和人员 Token。",
+    "RESOURCE_NOT_FOUND": "刷新列表并确认资源编号与当前公司或负责人一致。",
+    "INVALID_ARGUMENT": "按工具参数说明修正输入后重试。",
+    "INVALID_STATE_TRANSITION": "刷新任务详情，按 next_actions 中允许的动作继续。",
+    "IDEMPOTENCY_CONFLICT": "为不同业务内容使用新的幂等键；原请求可继续使用原键。",
+    "CONCURRENT_MODIFICATION": "刷新最新状态，确认后使用新的幂等键重试。",
+    "EXTERNAL_DEPENDENCY_FAILED": "检查依赖服务健康状态后使用相同幂等键重试。",
+}
+
+
 @app.exception_handler(WorkflowError)
-async def workflow_error_handler(_: Any, exc: WorkflowError) -> JSONResponse:
+async def workflow_error_handler(_: Request, exc: WorkflowError) -> JSONResponse:
     return JSONResponse(
         status_code=exc.status_code,
-        content={"success": False, "error": {"code": exc.code, "message": exc.message}},
+        content={
+            "success": False,
+            "error": {
+                "code": exc.code,
+                "message": exc.message,
+                "remediation": _REMEDIATIONS.get(exc.code, "保留 request_id 并联系管理员。"),
+            },
+            "next_actions": [],
+        },
     )
 
 
@@ -124,17 +185,27 @@ _HTTP_ERROR_CODES = {
     404: "RESOURCE_NOT_FOUND",
     405: "INVALID_ARGUMENT",
     410: "RESOURCE_NOT_FOUND",
+    413: "FILE_TOO_LARGE",
+    422: "INVALID_ARGUMENT",
+    503: "EXTERNAL_DEPENDENCY_FAILED",
 }
 
 
 @app.exception_handler(HTTPException)
 async def http_error_handler(_: Any, exc: HTTPException) -> JSONResponse:
-    code = _HTTP_ERROR_CODES.get(exc.status_code, "WORKFLOW_ERROR")
+    code = _HTTP_ERROR_CODES.get(
+        exc.status_code, "INTERNAL_ERROR" if exc.status_code >= 500 else "INVALID_ARGUMENT"
+    )
     return JSONResponse(
         status_code=exc.status_code,
         content={
             "success": False,
-            "error": {"code": code, "message": str(exc.detail)},
+            "error": {
+                "code": code,
+                "message": str(exc.detail),
+                "remediation": _REMEDIATIONS.get(code, "保留 request_id 并联系管理员。"),
+            },
+            "next_actions": [],
         },
     )
 
@@ -145,7 +216,49 @@ async def request_validation_handler(_: Any, exc: RequestValidationError) -> JSO
         status_code=400,
         content={
             "success": False,
-            "error": {"code": "INVALID_ARGUMENT", "message": "请求参数校验失败。"},
+            "error": {
+                "code": "INVALID_ARGUMENT",
+                "message": "请求参数校验失败。",
+                "remediation": "按工具参数 Schema 修正字段、类型和取值后重试。",
+            },
+            "next_actions": [],
+        },
+    )
+
+
+@app.exception_handler(StaleDataError)
+async def stale_data_handler(_: Request, __: StaleDataError) -> JSONResponse:
+    return JSONResponse(
+        status_code=409,
+        content={
+            "success": False,
+            "error": {
+                "code": "CONCURRENT_MODIFICATION",
+                "message": "资源已被其他请求修改。",
+                "remediation": _REMEDIATIONS["CONCURRENT_MODIFICATION"],
+            },
+            "next_actions": [],
+        },
+    )
+
+
+@app.exception_handler(Exception)
+async def unexpected_error_handler(request: Request, exc: Exception) -> JSONResponse:
+    logger.exception(
+        "unhandled_api_error",
+        extra={"path": request.url.path, "result_code": "INTERNAL_ERROR"},
+        exc_info=exc,
+    )
+    return JSONResponse(
+        status_code=500,
+        content={
+            "success": False,
+            "error": {
+                "code": "INTERNAL_ERROR",
+                "message": "系统处理失败。",
+                "remediation": "保留 request_id 并联系管理员检查 API 日志。",
+            },
+            "next_actions": [],
         },
     )
 
@@ -188,7 +301,7 @@ def employee_actor(
 
 @app.get("/health/live")
 def health_live() -> dict[str, str]:
-    return {"status": "ok", "service": "workflow-api", "phase": "T1"}
+    return {"status": "ok", "service": "workflow-api", "phase": "T4"}
 
 
 @app.get("/health/ready")
@@ -203,7 +316,7 @@ def health_ready(
     return {
         "status": "ready",
         "service": "workflow-api",
-        "phase": "T1",
+        "phase": "T4",
         "database_ready": True,
         "file_storage_ready": True,
         "disk_free_percent": free_percent,
@@ -376,7 +489,16 @@ class PriorityBody(BaseModel):
 
 class ListProjectsBody(BaseModel):
     status: str | None = None
-    limit: int = 50
+    assignee_id: str | None = None
+    priority: bool | None = None
+    import_batch_id: str | None = None
+    keyword: str | None = None
+    created_from: datetime | None = None
+    created_to: datetime | None = None
+    page: int = Field(default=1, ge=1)
+    page_size: int = Field(default=50, ge=1, le=100)
+    # T2 旧契约兼容；新调用使用 page_size。
+    limit: int | None = Field(default=None, ge=1, le=100)
 
 
 class TaskNoBody(BaseModel):
@@ -393,7 +515,10 @@ class ReviewBody(BaseModel):
 
 class MyTasksBody(BaseModel):
     status: str | None = None
-    limit: int = 50
+    priority: bool | None = None
+    page: int = Field(default=1, ge=1)
+    page_size: int = Field(default=50, ge=1, le=100)
+    limit: int | None = Field(default=None, ge=1, le=100)
 
 
 class SubmitScriptBody(BaseModel):
@@ -403,6 +528,23 @@ class SubmitScriptBody(BaseModel):
     content_base64: str | None = None
     file_url: str | None = None
     note: str | None = None
+
+
+class PageBody(BaseModel):
+    page: int = Field(default=1, ge=1)
+    page_size: int = Field(default=50, ge=1, le=100)
+
+
+class OperationalIssuesBody(PageBody):
+    issue_type: str | None = None
+    status: str | None = None
+
+
+class ReportBlockerBody(BaseModel):
+    task_no: str
+    blocker_type: str
+    description: str
+    idempotency_key: str
 
 
 @app.post("/internal/tools/import-topic-document")
@@ -482,7 +624,16 @@ def tool_list_content_projects(
     actor: Annotated[ActorProfile, Depends(boss_actor)],
 ) -> dict[str, Any]:
     return t2_service.list_projects(
-        actor_name=actor.display_name, status=body.status, limit=body.limit
+        actor_name=actor.display_name,
+        status=body.status,
+        assignee_id=body.assignee_id,
+        priority=body.priority,
+        import_batch_id=body.import_batch_id,
+        keyword=body.keyword,
+        created_from=body.created_from,
+        created_to=body.created_to,
+        page=body.page,
+        page_size=body.limit or body.page_size,
     )
 
 
@@ -496,9 +647,35 @@ def tool_get_content_project(
 
 @app.post("/internal/tools/list-pending-reviews")
 def tool_list_pending_reviews(
+    body: PageBody,
     actor: Annotated[ActorProfile, Depends(boss_actor)],
 ) -> dict[str, Any]:
-    return t2_service.pending_reviews(actor_name=actor.display_name)
+    return t2_service.pending_reviews(
+        actor_name=actor.display_name,
+        page=body.page,
+        page_size=body.page_size,
+    )
+
+
+@app.post("/internal/tools/get-workflow-dashboard")
+def tool_get_workflow_dashboard(
+    actor: Annotated[ActorProfile, Depends(boss_actor)],
+) -> dict[str, Any]:
+    return t2_service.dashboard(actor_name=actor.display_name)
+
+
+@app.post("/internal/tools/list-operational-issues")
+def tool_list_operational_issues(
+    body: OperationalIssuesBody,
+    actor: Annotated[ActorProfile, Depends(boss_actor)],
+) -> dict[str, Any]:
+    return t2_service.operational_issues(
+        actor_name=actor.display_name,
+        issue_type=body.issue_type,
+        status=body.status,
+        page=body.page,
+        page_size=body.page_size,
+    )
 
 
 @app.post("/internal/tools/review-script-submission")
@@ -522,7 +699,11 @@ def tool_list_my_tasks(
     actor: Annotated[ActorProfile, Depends(employee_actor)],
 ) -> dict[str, Any]:
     return t2_service.list_my_tasks(
-        actor_name=actor.display_name, status=body.status, limit=body.limit
+        actor_name=actor.display_name,
+        status=body.status,
+        priority=body.priority,
+        page=body.page,
+        page_size=body.limit or body.page_size,
     )
 
 
@@ -547,6 +728,20 @@ def tool_submit_script_file(
         content_base64=body.content_base64,
         file_url=body.file_url,
         note=body.note,
+    )
+
+
+@app.post("/internal/tools/report-task-blocker")
+def tool_report_task_blocker(
+    body: ReportBlockerBody,
+    actor: Annotated[ActorProfile, Depends(employee_actor)],
+) -> dict[str, Any]:
+    return t2_service.report_blocker(
+        actor_name=actor.display_name,
+        task_no=body.task_no,
+        blocker_type=body.blocker_type,
+        description=body.description,
+        idempotency_key=body.idempotency_key,
     )
 
 

@@ -40,6 +40,10 @@ def test_boss_and_employee_tool_whitelists_are_isolated(tmp_path: Path) -> None:
     assert "t0_probe_wecom_mention" not in employee_tools
     assert "import_topic_document" in boss_tools
     assert "review_script_submission" in boss_tools
+    assert "get_workflow_dashboard" in boss_tools
+    assert "list_operational_issues" in boss_tools
     assert "submit_script_file" not in boss_tools
     assert "submit_script_file" in employee_tools
+    assert "report_task_blocker" in employee_tools
+    assert "get_workflow_dashboard" not in employee_tools
     assert "import_topic_document" not in employee_tools

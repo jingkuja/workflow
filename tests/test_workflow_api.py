@@ -53,6 +53,8 @@ def test_auth_matrix_and_unified_error_structure(api) -> None:
     assert missing.status_code == 401
     assert missing.json()["success"] is False
     assert missing.json()["error"]["code"] == "UNAUTHENTICATED"
+    assert missing.json()["request_id"].startswith("req_")
+    assert missing.json()["error"]["remediation"]
 
     invalid = api.get("/internal/t1/identity", headers={"Authorization": "Bearer nope-nope-nope"})
     assert invalid.status_code == 401

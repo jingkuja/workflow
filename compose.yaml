@@ -20,6 +20,28 @@ x-app-common: &app-common
       max-size: "20m"
       max-file: "5"
 
+x-mcp-environment: &mcp-environment
+  APP_ENV: ${APP_ENV:-development}
+  APP_TIMEZONE: ${APP_TIMEZONE:-Asia/Shanghai}
+  PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-http://localhost:8080}
+  INTERNAL_API_BASE_URL: ${INTERNAL_API_BASE_URL:-http://workflow-api:8000}
+  PROBE_DATA_DIR: ${PROBE_DATA_DIR:-/data/probes}
+  FILE_DATA_DIR: ${FILE_DATA_DIR:-/data/files}
+  DATABASE_URL: "sqlite+pysqlite:///:memory:"
+  COMPANY_ID: ${COMPANY_ID:-default}
+  DISK_REJECT_PERCENT: ${DISK_REJECT_PERCENT:-10}
+  MCP_ALLOWED_HOSTS: ${MCP_ALLOWED_HOSTS:-localhost,localhost:*,127.0.0.1,127.0.0.1:*}
+  MCP_ALLOWED_ORIGINS: ${MCP_ALLOWED_ORIGINS:-http://localhost:*,http://127.0.0.1:*}
+  MCP_BOSS_NAME: ${MCP_BOSS_NAME:-老板测试}
+  MCP_BOSS_TOKEN: ${MCP_BOSS_TOKEN:-dev-boss-token-change-me}
+  MCP_BOSS_WECOM_USERID: ${MCP_BOSS_WECOM_USERID:-}
+  MCP_EMPLOYEES_JSON: ${MCP_EMPLOYEES_JSON:-[]}
+  MAX_TOPIC_DOCUMENT_BYTES: ${MAX_TOPIC_DOCUMENT_BYTES:-10485760}
+  MAX_SCRIPT_DOCUMENT_BYTES: ${MAX_SCRIPT_DOCUMENT_BYTES:-104857600}
+  MAX_VIDEO_BYTES: ${MAX_VIDEO_BYTES:-104857600}
+  T0_ALLOW_WECOM_SEND: ${T0_ALLOW_WECOM_SEND:-false}
+  WECOM_GROUP_WEBHOOK_URL: ${WECOM_GROUP_WEBHOOK_URL:-}
+
 services:
   reverse-proxy:
     image: nginx:1.28.0-alpine
@@ -93,6 +115,9 @@ services:
 
   boss-mcp:
     <<: *app-common
+    # T4 架构门禁：不继承含 PostgreSQL 密码的 .env，只注入 MCP 所需配置。
+    env_file: []
+    environment: *mcp-environment
     depends_on:
       db-migrate:
         condition: service_completed_successfully
@@ -119,6 +144,9 @@ services:
 
   employee-mcp:
     <<: *app-common
+    # T4 架构门禁：不继承含 PostgreSQL 密码的 .env，只注入 MCP 所需配置。
+    env_file: []
+    environment: *mcp-environment
     depends_on:
       db-migrate:
         condition: service_completed_successfully

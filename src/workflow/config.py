@@ -52,6 +52,8 @@ class Settings(BaseSettings):
     notification_send_enabled: bool = False
     workday_start_hour: int = Field(default=9, ge=0, le=23)
     workday_end_hour: int = Field(default=18, ge=1, le=23)
+    weekly_target_min: int = Field(default=35, ge=1)
+    weekly_target_max: int = Field(default=40, ge=1)
     mcp_allowed_hosts: str = "localhost,localhost:*,127.0.0.1,127.0.0.1:*"
     mcp_allowed_origins: str = "http://localhost:*,http://127.0.0.1:*"
 
@@ -82,6 +84,8 @@ class Settings(BaseSettings):
     def validate_workday_hours(self) -> Settings:
         if self.workday_end_hour <= self.workday_start_hour:
             raise ValueError("WORKDAY_END_HOUR 必须晚于 WORKDAY_START_HOUR")
+        if self.weekly_target_max < self.weekly_target_min:
+            raise ValueError("WEEKLY_TARGET_MAX 不能小于 WEEKLY_TARGET_MIN")
         return self
 
     def actors(self) -> tuple[Actor, ...]:

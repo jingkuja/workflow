@@ -5,9 +5,10 @@ import io
 import logging
 import secrets
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
@@ -19,8 +20,11 @@ from workflow.db.models import (
     Attachment,
     AttachmentStatus,
     AuditEvent,
+    BackgroundJob,
+    Blocker,
     ContentProject,
     ImportBatch,
+    JobStatus,
     Notification,
     NotificationStatus,
     Review,
@@ -38,6 +42,7 @@ from workflow.errors import (
     WorkflowError,
 )
 from workflow.idempotency import replay_or_none, save_response
+from workflow.request_context import current_request_id
 from workflow.storage import LocalStorage
 from workflow.t2.allocation import (
     advisory_lock,
@@ -495,35 +500,360 @@ class T2Service:
         with session_scope(self.sessions) as session:
             actor = self._actor(session, actor_name, Role.BOSS)
             now = datetime.now(UTC)
-            loads = employee_loads(session, actor.company_id, now, self.settings.app_timezone)
-            return {
-                "success": True,
-                "data": [
+            load_by_id = {
+                employee.id: count
+                for employee, count in employee_loads(
+                    session, actor.company_id, now, self.settings.app_timezone
+                )
+            }
+            employees = session.scalars(
+                select(ActorProfile)
+                .where(
+                    ActorProfile.company_id == actor.company_id,
+                    ActorProfile.role == Role.EMPLOYEE,
+                )
+                .order_by(ActorProfile.active.desc(), ActorProfile.display_name, ActorProfile.id)
+            ).all()
+            tasks = session.scalars(
+                select(StageTask).where(StageTask.company_id == actor.company_id)
+            ).all()
+            submissions = session.scalars(
+                select(Submission).where(Submission.company_id == actor.company_id)
+            ).all()
+            reviews = session.scalars(
+                select(Review).where(Review.company_id == actor.company_id)
+            ).all()
+            reviews_by_submission = {review.submission_id: review for review in reviews}
+            submissions_by_employee: dict[str, list[Submission]] = {}
+            for submission in submissions:
+                submissions_by_employee.setdefault(submission.submitted_by, []).append(submission)
+            rows: list[dict[str, Any]] = []
+            terminal = {"APPROVED", "COMPLETED", "CANCELLED"}
+            for employee in employees:
+                employee_submissions = submissions_by_employee.get(employee.id, [])
+                first_versions = [
+                    item for item in employee_submissions if item.version_no == 1
+                ]
+                reviewed_first = [
+                    reviews_by_submission[item.id]
+                    for item in first_versions
+                    if item.id in reviews_by_submission
+                ]
+                approved = [
+                    reviews_by_submission[item.id]
+                    for item in employee_submissions
+                    if item.id in reviews_by_submission
+                    and reviews_by_submission[item.id].decision == "APPROVED"
+                ]
+                approval_hours = []
+                submission_by_id = {item.id: item for item in employee_submissions}
+                for review in approved:
+                    submitted_at = submission_by_id[review.submission_id].created_at
+                    approval_hours.append(
+                        max(
+                            0.0,
+                            (
+                                self._aware(review.created_at)
+                                - self._aware(submitted_at)
+                            ).total_seconds()
+                            / 3600,
+                        )
+                    )
+                rows.append(
                     {
                         "employee_id": employee.id,
                         "display_name": employee.display_name,
-                        "weekly_task_count": count,
+                        "active": employee.active,
+                        "wecom_bound": bool(employee.wecom_userid),
+                        "weekly_task_count": load_by_id.get(employee.id, 0),
+                        "current_task_count": sum(
+                            1
+                            for task in tasks
+                            if task.assignee_id == employee.id and task.status not in terminal
+                        ),
+                        "average_review_hours": round(
+                            sum(approval_hours) / len(approval_hours), 2
+                        )
+                        if approval_hours
+                        else None,
+                        "first_pass_rate": round(
+                            sum(
+                                1
+                                for review in reviewed_first
+                                if review.decision == "APPROVED"
+                            )
+                            / len(reviewed_first),
+                            4,
+                        )
+                        if reviewed_first
+                        else None,
                     }
-                    for employee, count in loads
-                ],
-                "user_message": f"共 {len(loads)} 名在岗员工。",
+                )
+            return {
+                "success": True,
+                "data": rows,
+                "user_message": f"共 {len(rows)} 名员工，其中 "
+                f"{sum(1 for item in rows if item['active'])} 名在岗。",
+                "next_actions": ["get_workflow_dashboard", "list_content_projects"],
             }
 
     def list_projects(
-        self, *, actor_name: str, status: str | None = None, limit: int = 50
+        self,
+        *,
+        actor_name: str,
+        status: str | None = None,
+        assignee_id: str | None = None,
+        priority: bool | None = None,
+        import_batch_id: str | None = None,
+        keyword: str | None = None,
+        created_from: datetime | None = None,
+        created_to: datetime | None = None,
+        page: int = 1,
+        page_size: int = 50,
     ) -> dict[str, Any]:
+        self._validate_page(page, page_size)
         with session_scope(self.sessions) as session:
             actor = self._actor(session, actor_name, Role.BOSS)
-            query = select(ContentProject).where(ContentProject.company_id == actor.company_id)
+            query = (
+                select(ContentProject)
+                .join(StageTask, StageTask.project_id == ContentProject.id)
+                .where(ContentProject.company_id == actor.company_id)
+            )
             if status:
                 query = query.where(ContentProject.status == status)
+            if assignee_id:
+                query = query.where(StageTask.assignee_id == assignee_id)
+            if priority is not None:
+                query = query.where(
+                    StageTask.priority == ("PRIORITY" if priority else "NORMAL")
+                )
+            if import_batch_id:
+                query = query.where(ContentProject.import_batch_id == import_batch_id)
+            if keyword:
+                query = query.where(ContentProject.title.ilike(f"%{keyword.strip()}%"))
+            if created_from:
+                query = query.where(ContentProject.created_at >= created_from)
+            if created_to:
+                query = query.where(ContentProject.created_at <= created_to)
+            total = session.scalar(
+                select(func.count()).select_from(query.order_by(None).subquery())
+            ) or 0
             projects = session.scalars(
-                query.order_by(ContentProject.created_at.desc()).limit(min(limit, 100))
+                query.order_by(ContentProject.created_at.desc(), ContentProject.id)
+                .offset((page - 1) * page_size)
+                .limit(page_size)
             ).all()
             return {
                 "success": True,
                 "data": [self._project_dict(session, project) for project in projects],
+                "pagination": self._pagination(page, page_size, total),
                 "user_message": f"查询到 {len(projects)} 个内容项目。",
+                "next_actions": self._list_next_actions(page, page_size, total),
+            }
+
+    def dashboard(self, *, actor_name: str) -> dict[str, Any]:
+        with session_scope(self.sessions) as session:
+            actor = self._actor(session, actor_name, Role.BOSS)
+            now = datetime.now(UTC)
+            timezone = ZoneInfo(self.settings.app_timezone)
+            local_now = now.astimezone(timezone)
+            today_start = local_now.replace(hour=0, minute=0, second=0, microsecond=0)
+            week_start = (today_start - timedelta(days=today_start.weekday())).astimezone(UTC)
+            today_start_utc = today_start.astimezone(UTC)
+
+            projects = session.scalars(
+                select(ContentProject).where(ContentProject.company_id == actor.company_id)
+            ).all()
+            tasks = session.scalars(
+                select(StageTask).where(StageTask.company_id == actor.company_id)
+            ).all()
+            submissions = session.scalars(
+                select(Submission).where(Submission.company_id == actor.company_id)
+            ).all()
+            reviews = session.scalars(
+                select(Review).where(Review.company_id == actor.company_id)
+            ).all()
+            open_blockers = session.scalars(
+                select(Blocker).where(
+                    Blocker.company_id == actor.company_id,
+                    Blocker.status == "OPEN",
+                )
+            ).all()
+
+            stage_counts: dict[str, int] = {}
+            for project in projects:
+                stage_counts[project.status] = stage_counts.get(project.status, 0) + 1
+            backlog: dict[str, int] = {}
+            for task in tasks:
+                if task.task_type == "SCRIPT":
+                    backlog[task.status] = backlog.get(task.status, 0) + 1
+            approved_reviews = [
+                review for review in reviews if review.decision == "APPROVED"
+            ]
+            approved_today = sum(
+                1
+                for review in approved_reviews
+                if self._aware(review.created_at) >= today_start_utc
+            )
+            approved_week = sum(
+                1
+                for review in approved_reviews
+                if self._aware(review.created_at) >= week_start
+            )
+            reviewed_first = []
+            submission_by_id = {item.id: item for item in submissions}
+            task_by_id = {item.id: item for item in tasks}
+            stage_hours: list[float] = []
+            approved_versions: list[int] = []
+            for review in approved_reviews:
+                submission = submission_by_id.get(review.submission_id)
+                task = task_by_id.get(submission.task_id) if submission else None
+                if submission is None or task is None:
+                    continue
+                started_at = task.effective_started_at or task.created_at
+                stage_hours.append(
+                    max(
+                        0.0,
+                        (
+                            self._aware(review.created_at)
+                            - self._aware(started_at)
+                        ).total_seconds()
+                        / 3600,
+                    )
+                )
+                approved_versions.append(submission.version_no)
+            for review in reviews:
+                submission = submission_by_id.get(review.submission_id)
+                if submission is not None and submission.version_no == 1:
+                    reviewed_first.append(review)
+            first_pass_rate = (
+                round(
+                    sum(1 for review in reviewed_first if review.decision == "APPROVED")
+                    / len(reviewed_first),
+                    4,
+                )
+                if reviewed_first
+                else None
+            )
+            priority_items = [
+                self._task_dict(session, task)
+                for task in sorted(
+                    (
+                        task
+                        for task in tasks
+                        if task.priority == "PRIORITY"
+                        and task.status not in {"APPROVED", "CANCELLED"}
+                    ),
+                    key=lambda item: (
+                        self._aware(item.effective_started_at or item.created_at),
+                        item.task_no,
+                    ),
+                )[:10]
+            ]
+            rejected = sorted(
+                (review for review in reviews if review.decision == "REJECTED"),
+                key=lambda item: self._aware(item.created_at),
+                reverse=True,
+            )[:10]
+            recent_rejections = []
+            for review in rejected:
+                submission = submission_by_id.get(review.submission_id)
+                task = session.get(StageTask, submission.task_id) if submission else None
+                recent_rejections.append(
+                    {
+                        "task_no": task.task_no if task else None,
+                        "comment": review.comment,
+                        "reason_category": review.reason_category,
+                        "created_at": self._aware(review.created_at).isoformat(),
+                    }
+                )
+            failed_job_count = session.scalar(
+                select(func.count()).select_from(BackgroundJob).where(
+                    BackgroundJob.company_id == actor.company_id,
+                    BackgroundJob.status.in_([JobStatus.FAILED, JobStatus.DEAD]),
+                )
+            ) or 0
+            failed_notification_count = session.scalar(
+                select(func.count()).select_from(Notification).where(
+                    Notification.company_id == actor.company_id,
+                    Notification.status.in_(
+                        [NotificationStatus.FAILED, NotificationStatus.DEAD]
+                    ),
+                )
+            ) or 0
+            employee_rows = self._employee_load_summary(session, actor.company_id, now)
+            recent_blockers = []
+            for blocker in sorted(
+                open_blockers,
+                key=lambda item: self._aware(item.created_at),
+                reverse=True,
+            )[:10]:
+                task = task_by_id.get(blocker.task_id)
+                reporter = session.get(ActorProfile, blocker.reported_by)
+                recent_blockers.append(
+                    {
+                        "blocker_id": blocker.id,
+                        "task_no": task.task_no if task else None,
+                        "blocker_type": blocker.blocker_type,
+                        "description": blocker.description,
+                        "reported_by": reporter.display_name if reporter else None,
+                        "created_at": self._aware(blocker.created_at).isoformat(),
+                    }
+                )
+            return {
+                "success": True,
+                "data": {
+                    "generated_at": now.isoformat(),
+                    "normal_terminal_status": "WAITING_FOR_FILMING",
+                    "stage_counts": stage_counts,
+                    "script_backlog": backlog,
+                    "today": {
+                        "created_count": sum(
+                            1
+                            for project in projects
+                            if self._aware(project.created_at) >= today_start_utc
+                        ),
+                        "approved_count": approved_today,
+                    },
+                    "this_week": {
+                        "created_count": sum(
+                            1
+                            for project in projects
+                            if self._aware(project.created_at) >= week_start
+                        ),
+                        "approved_count": approved_week,
+                        "target_min": self.settings.weekly_target_min,
+                        "target_max": self.settings.weekly_target_max,
+                        "gap_to_min": max(
+                            0, self.settings.weekly_target_min - approved_week
+                        ),
+                    },
+                    "pending_review_count": backlog.get("SUBMITTED", 0),
+                    "first_pass_rate": first_pass_rate,
+                    "average_script_stage_hours": round(
+                        sum(stage_hours) / len(stage_hours), 2
+                    )
+                    if stage_hours
+                    else None,
+                    "average_approved_version": round(
+                        sum(approved_versions) / len(approved_versions), 2
+                    )
+                    if approved_versions
+                    else None,
+                    "priority_tasks": priority_items,
+                    "recent_rejections": recent_rejections,
+                    "open_blocker_count": len(open_blockers),
+                    "recent_blockers": recent_blockers,
+                    "failed_background_job_count": failed_job_count,
+                    "failed_notification_count": failed_notification_count,
+                    "employee_loads": employee_rows,
+                },
+                "user_message": "已生成 T2 工作流概览。",
+                "next_actions": [
+                    "list_pending_reviews",
+                    "list_content_projects",
+                    "list_operational_issues",
+                ],
             }
 
     def get_project(self, *, actor_name: str, task_no: str) -> dict[str, Any]:
@@ -541,8 +871,11 @@ class T2Service:
         *,
         actor_name: str,
         status: str | None = None,
-        limit: int = 50,
+        priority: bool | None = None,
+        page: int = 1,
+        page_size: int = 50,
     ) -> dict[str, Any]:
+        self._validate_page(page, page_size)
         with session_scope(self.sessions) as session:
             actor = self._actor(session, actor_name, Role.EMPLOYEE)
             query = select(StageTask).where(
@@ -552,18 +885,29 @@ class T2Service:
             )
             if status:
                 query = query.where(StageTask.status == status)
+            if priority is not None:
+                query = query.where(
+                    StageTask.priority == ("PRIORITY" if priority else "NORMAL")
+                )
+            total = session.scalar(
+                select(func.count()).select_from(query.order_by(None).subquery())
+            ) or 0
             tasks = session.scalars(
                 query.order_by(
                     StageTask.priority.desc(),
                     StageTask.effective_started_at,
                     StageTask.created_at,
                     StageTask.task_no,
-                ).limit(min(limit, 100))
+                )
+                .offset((page - 1) * page_size)
+                .limit(page_size)
             ).all()
             return {
                 "success": True,
                 "data": [self._task_dict(session, task) for task in tasks],
-                "user_message": f"你有 {len(tasks)} 条匹配任务。",
+                "pagination": self._pagination(page, page_size, total),
+                "user_message": f"你有 {total} 条匹配任务，本页 {len(tasks)} 条。",
+                "next_actions": self._list_next_actions(page, page_size, total),
             }
 
     def get_my_task(self, *, actor_name: str, task_no: str) -> dict[str, Any]:
@@ -696,22 +1040,267 @@ class T2Service:
             )
             return replayed if replayed is not None else response
 
-    def pending_reviews(self, *, actor_name: str) -> dict[str, Any]:
+    def pending_reviews(
+        self, *, actor_name: str, page: int = 1, page_size: int = 50
+    ) -> dict[str, Any]:
+        self._validate_page(page, page_size)
         with session_scope(self.sessions) as session:
             actor = self._actor(session, actor_name, Role.BOSS)
+            query = select(StageTask).where(
+                StageTask.company_id == actor.company_id,
+                StageTask.task_type == "SCRIPT",
+                StageTask.status == "SUBMITTED",
+            )
+            total = session.scalar(
+                select(func.count()).select_from(query.order_by(None).subquery())
+            ) or 0
             tasks = session.scalars(
-                select(StageTask)
-                .where(
-                    StageTask.company_id == actor.company_id,
-                    StageTask.task_type == "SCRIPT",
-                    StageTask.status == "SUBMITTED",
+                query.order_by(
+                    StageTask.priority.desc(),
+                    StageTask.created_at,
+                    StageTask.task_no,
                 )
-                .order_by(StageTask.created_at)
+                .offset((page - 1) * page_size)
+                .limit(page_size)
             ).all()
+            rows = []
+            for task in tasks:
+                item = self._task_dict(session, task)
+                latest = session.scalar(
+                    select(Submission)
+                    .where(Submission.task_id == task.id)
+                    .order_by(Submission.version_no.desc())
+                    .limit(1)
+                )
+                attachment = (
+                    session.get(Attachment, latest.attachment_id)
+                    if latest and latest.attachment_id
+                    else None
+                )
+                item["latest_submission"] = (
+                    {
+                        "version_no": latest.version_no,
+                        "note": latest.note,
+                        "submitted_at": self._aware(latest.created_at).isoformat(),
+                        "download_url": self._download_url(attachment)
+                        if attachment
+                        else None,
+                    }
+                    if latest
+                    else None
+                )
+                rows.append(item)
             return {
                 "success": True,
-                "data": [self._task_dict(session, task) for task in tasks],
-                "user_message": f"有 {len(tasks)} 条演播稿待审核。",
+                "data": rows,
+                "pagination": self._pagination(page, page_size, total),
+                "user_message": f"共有 {total} 条演播稿待审核，本页 {len(rows)} 条。",
+                "next_actions": self._list_next_actions(page, page_size, total)
+                + (["review_script_submission"] if rows else []),
+            }
+
+    def report_blocker(
+        self,
+        *,
+        actor_name: str,
+        task_no: str,
+        blocker_type: str,
+        description: str,
+        idempotency_key: str,
+    ) -> dict[str, Any]:
+        blocker_type = blocker_type.strip().upper()
+        description = description.strip()
+        if not blocker_type or not description:
+            raise InvalidArgument("阻塞类型和说明不能为空。")
+        payload = {
+            "task_no": task_no,
+            "blocker_type": blocker_type,
+            "description": description,
+        }
+        with session_scope(self.sessions) as session:
+            actor = self._actor(session, actor_name, Role.EMPLOYEE)
+            replay = self._replay(
+                session, actor, "report_task_blocker", idempotency_key, payload
+            )
+            if replay is not None:
+                return replay
+            task = session.scalar(
+                select(StageTask)
+                .where(
+                    StageTask.task_no == task_no,
+                    StageTask.company_id == actor.company_id,
+                    StageTask.assignee_id == actor.id,
+                )
+                .with_for_update()
+            )
+            if task is None:
+                raise ResourceNotFound("任务不存在或不属于当前员工。")
+            if task.status in {"APPROVED", "COMPLETED", "CANCELLED"}:
+                raise InvalidStateTransition("已结束任务不能上报新的阻塞事项。")
+            blocker = Blocker(
+                company_id=actor.company_id,
+                task_id=task.id,
+                blocker_type=blocker_type,
+                description=description,
+                status="OPEN",
+                reported_by=actor.id,
+            )
+            session.add(blocker)
+            session.flush()
+            self._audit(
+                session,
+                actor,
+                "TASK_BLOCKER_REPORTED",
+                "blocker",
+                blocker.id,
+                {
+                    "task_no": task.task_no,
+                    "blocker_type": blocker_type,
+                    "status": "OPEN",
+                },
+            )
+            boss = self._boss(session, actor.company_id)
+            self._notify(
+                session,
+                actor.company_id,
+                "TASK_BLOCKER_REPORTED",
+                f"任务 {task.task_no} 上报阻塞：{blocker_type}",
+                [boss.wecom_userid],
+            )
+            response = {
+                "success": True,
+                "data": {
+                    "blocker_id": blocker.id,
+                    "task_no": task.task_no,
+                    "blocker_type": blocker.blocker_type,
+                    "description": blocker.description,
+                    "status": blocker.status,
+                },
+                "user_message": "阻塞事项已记录并通知老板。",
+                "next_actions": ["get_my_task"],
+            }
+            replayed = self._save_idempotency(
+                session,
+                actor,
+                "report_task_blocker",
+                idempotency_key,
+                payload,
+                response,
+            )
+            return replayed if replayed is not None else response
+
+    def operational_issues(
+        self,
+        *,
+        actor_name: str,
+        issue_type: str | None = None,
+        status: str | None = None,
+        page: int = 1,
+        page_size: int = 50,
+    ) -> dict[str, Any]:
+        self._validate_page(page, page_size)
+        normalized_type = (issue_type or "ALL").upper()
+        allowed_types = {"ALL", "BACKGROUND_JOB", "NOTIFICATION", "BLOCKER"}
+        if normalized_type not in allowed_types:
+            raise InvalidArgument(
+                "issue_type 必须是 ALL、BACKGROUND_JOB、NOTIFICATION 或 BLOCKER。"
+            )
+        normalized_status = status.upper() if status else None
+        with session_scope(self.sessions) as session:
+            actor = self._actor(session, actor_name, Role.BOSS)
+            items: list[dict[str, Any]] = []
+            if normalized_type in {"ALL", "BACKGROUND_JOB"}:
+                jobs = session.scalars(
+                    select(BackgroundJob).where(
+                        BackgroundJob.company_id == actor.company_id
+                    )
+                ).all()
+                for job in jobs:
+                    item_status = job.status.value
+                    if normalized_status:
+                        if item_status != normalized_status:
+                            continue
+                    elif item_status not in {"FAILED", "DEAD"}:
+                        continue
+                    items.append(
+                        {
+                            "issue_type": "BACKGROUND_JOB",
+                            "issue_id": job.id,
+                            "status": item_status,
+                            "job_type": job.job_type,
+                            "object_id": job.object_id,
+                            "attempts": job.attempts,
+                            "max_attempts": job.max_attempts,
+                            "last_error": job.last_error,
+                            "available_at": self._aware(job.available_at).isoformat(),
+                            "created_at": self._aware(job.created_at).isoformat(),
+                        }
+                    )
+            if normalized_type in {"ALL", "NOTIFICATION"}:
+                notifications = session.scalars(
+                    select(Notification).where(
+                        Notification.company_id == actor.company_id
+                    )
+                ).all()
+                for notification in notifications:
+                    item_status = notification.status.value
+                    if normalized_status:
+                        if item_status != normalized_status:
+                            continue
+                    elif item_status not in {"FAILED", "DEAD"}:
+                        continue
+                    items.append(
+                        {
+                            "issue_type": "NOTIFICATION",
+                            "issue_id": notification.id,
+                            "status": item_status,
+                            "event_id": notification.event_id,
+                            "template": notification.template,
+                            "attempts": notification.attempts,
+                            "last_error": notification.response_summary,
+                            "next_retry_at": self._aware(
+                                notification.next_retry_at
+                            ).isoformat(),
+                            "created_at": self._aware(
+                                notification.created_at
+                            ).isoformat(),
+                        }
+                    )
+            if normalized_type in {"ALL", "BLOCKER"}:
+                blockers = session.scalars(
+                    select(Blocker).where(Blocker.company_id == actor.company_id)
+                ).all()
+                for blocker in blockers:
+                    if normalized_status:
+                        if blocker.status.upper() != normalized_status:
+                            continue
+                    elif blocker.status.upper() != "OPEN":
+                        continue
+                    task = session.get(StageTask, blocker.task_id)
+                    reporter = session.get(ActorProfile, blocker.reported_by)
+                    items.append(
+                        {
+                            "issue_type": "BLOCKER",
+                            "issue_id": blocker.id,
+                            "status": blocker.status,
+                            "task_no": task.task_no if task else None,
+                            "blocker_type": blocker.blocker_type,
+                            "description": blocker.description,
+                            "reported_by": reporter.display_name if reporter else None,
+                            "created_at": self._aware(blocker.created_at).isoformat(),
+                        }
+                    )
+            items.sort(key=lambda item: item["created_at"], reverse=True)
+            total = len(items)
+            start = (page - 1) * page_size
+            page_items = items[start : start + page_size]
+            return {
+                "success": True,
+                "data": page_items,
+                "pagination": self._pagination(page, page_size, total),
+                "user_message": f"共有 {total} 条匹配的运维或阻塞事项。",
+                "next_actions": self._list_next_actions(page, page_size, total)
+                + ["get_workflow_dashboard"],
             }
 
     def review_script(
@@ -968,6 +1557,21 @@ class T2Service:
     def _task_dict(self, session: Session, task: StageTask) -> dict[str, Any]:
         project = session.get(ContentProject, task.project_id)
         assignee = session.get(ActorProfile, task.assignee_id) if task.assignee_id else None
+        next_actions: list[str]
+        if task.status == "PENDING_ASSIGNMENT":
+            next_actions = ["change_task_assignee", "delete_imported_task"]
+        elif task.status in {"IN_PROGRESS", "REJECTED"}:
+            next_actions = [
+                "submit_script_file",
+                "change_task_assignee",
+                "set_task_priority",
+                "report_task_blocker",
+            ]
+        elif task.status == "SUBMITTED":
+            next_actions = ["review_script_submission", "set_task_priority"]
+        else:
+            # APPROVED/WAITING_FOR_FILMING 是 T4 当前正常终态；不暴露 T3 动作。
+            next_actions = []
         return {
             "task_no": task.task_no,
             "title": project.title if project else "",
@@ -980,6 +1584,7 @@ class T2Service:
             "effective_started_at": task.effective_started_at.isoformat()
             if task.effective_started_at
             else None,
+            "next_actions": next_actions,
         }
 
     def _project_dict(self, session: Session, project: ContentProject) -> dict[str, Any]:
@@ -988,6 +1593,7 @@ class T2Service:
             "project_id": project.id,
             "title": project.title,
             "status": project.status,
+            "created_at": self._aware(project.created_at).isoformat(),
             "task": self._task_dict(session, task) if task else None,
         }
 
@@ -1002,23 +1608,53 @@ class T2Service:
             select(Submission).where(Submission.task_id == task.id).order_by(Submission.version_no)
         ).all()
         history = []
+        review_ids: list[str] = []
         for submission in submissions:
             attachment = session.get(Attachment, submission.attachment_id)
             review = session.scalar(select(Review).where(Review.submission_id == submission.id))
+            if review is not None:
+                review_ids.append(review.id)
             history.append(
                 {
                     "version_no": submission.version_no,
                     "note": submission.note,
+                    "submitted_at": self._aware(submission.created_at).isoformat(),
                     "download_url": self._download_url(attachment) if attachment else None,
                     "review": {
                         "decision": review.decision,
                         "reason_category": review.reason_category,
                         "comment": review.comment,
+                        "reviewed_at": self._aware(review.created_at).isoformat(),
                     }
                     if review
                     else None,
                 }
             )
+        object_ids = [project.id, task.id, *[item.id for item in submissions], *review_ids]
+        if batch is not None:
+            object_ids.append(batch.id)
+        audit_events = session.scalars(
+            select(AuditEvent)
+            .where(
+                AuditEvent.company_id == project.company_id,
+                AuditEvent.object_id.in_(object_ids),
+            )
+            .order_by(AuditEvent.created_at, AuditEvent.id)
+        ).all()
+        timeline = [
+            {
+                "event_id": event.id,
+                "action": event.action,
+                "object_type": event.object_type,
+                "object_id": event.object_id,
+                "actor_id": event.actor_id,
+                "before_state": event.before_state,
+                "after_state": event.after_state,
+                "request_id": event.request_id,
+                "created_at": self._aware(event.created_at).isoformat(),
+            }
+            for event in audit_events
+        ]
         return {
             "project_id": project.id,
             "title": project.title,
@@ -1030,6 +1666,7 @@ class T2Service:
             else None,
             "task": self._task_dict(session, task),
             "submission_history": history,
+            "timeline": timeline,
         }
 
     def _download_url(self, attachment: Attachment) -> str:
@@ -1070,6 +1707,9 @@ class T2Service:
         payload: dict[str, Any],
         response: dict[str, Any],
     ) -> dict[str, Any] | None:
+        request_id = current_request_id()
+        if request_id:
+            response.setdefault("request_id", request_id)
         return save_response(
             session,
             company_id=actor.company_id,
@@ -1079,6 +1719,61 @@ class T2Service:
             payload=payload,
             response=response,
         )
+
+    def _employee_load_summary(
+        self, session: Session, company_id: str, now: datetime
+    ) -> list[dict[str, Any]]:
+        loads = employee_loads(session, company_id, now, self.settings.app_timezone)
+        terminal = {"APPROVED", "COMPLETED", "CANCELLED"}
+        tasks = session.scalars(
+            select(StageTask).where(StageTask.company_id == company_id)
+        ).all()
+        return [
+            {
+                "employee_id": employee.id,
+                "display_name": employee.display_name,
+                "weekly_task_count": count,
+                "current_task_count": sum(
+                    1
+                    for task in tasks
+                    if task.assignee_id == employee.id and task.status not in terminal
+                ),
+            }
+            for employee, count in loads
+        ]
+
+    @staticmethod
+    def _validate_page(page: int, page_size: int) -> None:
+        if page < 1:
+            raise InvalidArgument("page 必须大于等于 1。")
+        if page_size < 1 or page_size > 100:
+            raise InvalidArgument("page_size 必须在 1 到 100 之间。")
+
+    @staticmethod
+    def _pagination(page: int, page_size: int, total: int) -> dict[str, Any]:
+        total_pages = (total + page_size - 1) // page_size if total else 0
+        return {
+            "page": page,
+            "page_size": page_size,
+            "total_items": total,
+            "total_pages": total_pages,
+            "has_previous": page > 1,
+            "has_next": page * page_size < total,
+        }
+
+    @staticmethod
+    def _list_next_actions(page: int, page_size: int, total: int) -> list[str]:
+        actions: list[str] = []
+        if page > 1:
+            actions.append("previous_page")
+        if page * page_size < total:
+            actions.append("next_page")
+        actions.extend(["filter_results", "view_detail"])
+        return actions
+
+    @staticmethod
+    def _aware(value: datetime) -> datetime:
+        return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
 
     def _audit(
         self,

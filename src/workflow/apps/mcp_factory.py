@@ -37,7 +37,8 @@ def create_mcp_server(settings: Settings, role: Role) -> FastMCP:
     mcp = FastMCP(
         server_name,
         instructions=(
-            "新媒体内容制作工作流服务。T2 支持选题 Word 导入、任务分配、员工演播稿提交和老板审核。"
+            "新媒体内容制作工作流服务。当前 T4 以演播稿审核通过后的 "
+            "WAITING_FOR_FILMING 为正常终态，并提供 T2 看板与运维查询。"
         ),
         stateless_http=True,
         json_response=True,
@@ -198,12 +199,29 @@ def create_mcp_server(settings: Settings, role: Role) -> FastMCP:
             context: Context,
             status: str | None = None,
             limit: int = 50,
+            assignee_id: str | None = None,
+            priority: bool | None = None,
+            import_batch_id: str | None = None,
+            keyword: str | None = None,
+            created_from: str | None = None,
+            created_to: str | None = None,
+            page: int = 1,
         ) -> dict[str, Any]:
             return api.call(
                 "/internal/tools/list-content-projects",
                 token=_caller(context).token,
                 tool="list_content_projects",
-                payload={"status": status, "limit": limit},
+                payload={
+                    "status": status,
+                    "assignee_id": assignee_id,
+                    "priority": priority,
+                    "import_batch_id": import_batch_id,
+                    "keyword": keyword,
+                    "created_from": created_from,
+                    "created_to": created_to,
+                    "page": page,
+                    "page_size": limit,
+                },
             )
 
         @mcp.tool(name="get_content_project", description="查询项目、源文案和版本历史。")
@@ -216,11 +234,48 @@ def create_mcp_server(settings: Settings, role: Role) -> FastMCP:
             )
 
         @mcp.tool(name="list_pending_reviews", description="查询待老板审核的演播稿。")
-        def list_pending_reviews(context: Context) -> dict[str, Any]:
+        def list_pending_reviews(
+            context: Context, page: int = 1, page_size: int = 50
+        ) -> dict[str, Any]:
             return api.call(
                 "/internal/tools/list-pending-reviews",
                 token=_caller(context).token,
                 tool="list_pending_reviews",
+                payload={"page": page, "page_size": page_size},
+            )
+
+        @mcp.tool(
+            name="get_workflow_dashboard",
+            description="获取 T2 概览、积压、目标差额和人员负载。",
+        )
+        def get_workflow_dashboard(context: Context) -> dict[str, Any]:
+            return api.call(
+                "/internal/tools/get-workflow-dashboard",
+                token=_caller(context).token,
+                tool="get_workflow_dashboard",
+            )
+
+        @mcp.tool(
+            name="list_operational_issues",
+            description="分页查询失败后台任务、失败通知和员工上报的阻塞事项。",
+        )
+        def list_operational_issues(
+            context: Context,
+            issue_type: str | None = None,
+            status: str | None = None,
+            page: int = 1,
+            page_size: int = 50,
+        ) -> dict[str, Any]:
+            return api.call(
+                "/internal/tools/list-operational-issues",
+                token=_caller(context).token,
+                tool="list_operational_issues",
+                payload={
+                    "issue_type": issue_type,
+                    "status": status,
+                    "page": page,
+                    "page_size": page_size,
+                },
             )
 
         @mcp.tool(name="review_script_submission", description="通过或驳回最新演播稿版本。")
@@ -281,12 +336,19 @@ def create_mcp_server(settings: Settings, role: Role) -> FastMCP:
             context: Context,
             status: str | None = None,
             limit: int = 50,
+            priority: bool | None = None,
+            page: int = 1,
         ) -> dict[str, Any]:
             return api.call(
                 "/internal/tools/list-my-tasks",
                 token=_caller(context).token,
                 tool="list_my_tasks",
-                payload={"status": status, "limit": limit},
+                payload={
+                    "status": status,
+                    "priority": priority,
+                    "page": page,
+                    "page_size": limit,
+                },
             )
 
         @mcp.tool(name="get_my_task", description="查询本人任务、源文案和审核历史。")
@@ -319,6 +381,29 @@ def create_mcp_server(settings: Settings, role: Role) -> FastMCP:
                     "content_base64": content_base64,
                     "file_url": file_url,
                     "note": note,
+                },
+            )
+
+        @mcp.tool(
+            name="report_task_blocker",
+            description="为本人未结束任务上报阻塞类型和非空说明。",
+        )
+        def report_task_blocker(
+            task_no: str,
+            blocker_type: str,
+            description: str,
+            idempotency_key: str,
+            context: Context,
+        ) -> dict[str, Any]:
+            return api.call(
+                "/internal/tools/report-task-blocker",
+                token=_caller(context).token,
+                tool="report_task_blocker",
+                payload={
+                    "task_no": task_no,
+                    "blocker_type": blocker_type,
+                    "description": description,
+                    "idempotency_key": idempotency_key,
                 },
             )
 

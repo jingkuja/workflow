@@ -32,6 +32,7 @@ dev = [
 workflow-t0-smoke = "workflow.scripts.t0_smoke:main"
 workflow-t1-smoke = "workflow.scripts.t1_smoke:main"
 workflow-t2-smoke = "workflow.scripts.t2_smoke:main"
+workflow-t4-smoke = "workflow.scripts.t4_smoke:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

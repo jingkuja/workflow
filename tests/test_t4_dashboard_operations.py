@@ -4,7 +4,7 @@ import base64
 from pathlib import Path
 
 from pydantic import SecretStr
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from workflow.config import Settings
 from workflow.db.models import (
@@ -75,6 +75,15 @@ def test_t4_dashboard_pagination_timeline_and_terminal_state(tmp_path: Path) -> 
     assert "next_page" in first_page["next_actions"]
 
     task = tasks[0]
+    service.set_priority(
+        actor_name="老板测试",
+        task_no=str(task["task_no"]),
+        priority=True,
+        idempotency_key="t4-priority-0001",
+    )
+    with session_scope(service.sessions) as session:
+        assert session.scalar(select(func.count()).select_from(Notification)) == 11
+
     service.submit_script(
         actor_name=str(task["assigned_employee_name"]),
         task_no=str(task["task_no"]),

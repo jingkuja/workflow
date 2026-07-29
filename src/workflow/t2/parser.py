@@ -88,6 +88,19 @@ def _iter_lines(document: Any) -> list[_Line]:
     return lines
 
 
+def _document_lines(content: bytes) -> list[_Line]:
+    try:
+        document = Document(BytesIO(content))
+    except Exception as exc:
+        raise TopicParseError("Word 文件无法解析或不是有效的 .docx。") from exc
+    return _iter_lines(document)
+
+
+def extract_document_text(content: bytes) -> str:
+    """提取 Word 中按阅读顺序排列的段落和表格文本，供结构化结果验真。"""
+    return "\n".join(line.text for line in _document_lines(content))
+
+
 def _split_blocks(lines: list[_Line]) -> list[tuple[int, str, list[_Line]]]:
     """以带序号一级标题为起点切块；无序号一级标题结束当前块。"""
     blocks: list[tuple[int, str, list[_Line]]] = []
@@ -149,12 +162,7 @@ def _parse_block(sequence: int, heading_title: str, lines: list[_Line]) -> Parse
 
 
 def parse_topic_document(content: bytes) -> ParseResult:
-    try:
-        document = Document(BytesIO(content))
-    except Exception as exc:
-        raise TopicParseError("Word 文件无法解析或不是有效的 .docx。") from exc
-
-    lines = _iter_lines(document)
+    lines = _document_lines(content)
     blocks = _split_blocks(lines)
     result = ParseResult()
     for sequence, heading_title, block_lines in blocks:

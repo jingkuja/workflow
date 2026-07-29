@@ -41,6 +41,7 @@ from workflow.logging import configure_logging
 from workflow.probes.storage import ProbeStorage
 from workflow.request_context import reset_request_id, set_request_id
 from workflow.storage import LocalStorage
+from workflow.t2.contracts import StructuredTopicImportBody
 from workflow.t2.service import T2Service
 
 configure_logging("workflow-api")
@@ -556,6 +557,23 @@ def tool_import_topic_document(
         actor_name=actor.display_name,
         original_filename=body.original_filename,
         idempotency_key=body.idempotency_key,
+        content_base64=body.content_base64,
+        file_url=body.file_url,
+    )
+
+
+@app.post("/internal/tools/import-structured-topics")
+def tool_import_structured_topics(
+    body: StructuredTopicImportBody,
+    actor: Annotated[ActorProfile, Depends(boss_actor)],
+) -> dict[str, Any]:
+    return t2_service.import_structured_topics(
+        actor_name=actor.display_name,
+        original_filename=body.original_filename,
+        idempotency_key=body.idempotency_key,
+        topics=body.topics,
+        warnings=body.warnings,
+        schema_version=body.schema_version,
         content_base64=body.content_base64,
         file_url=body.file_url,
     )

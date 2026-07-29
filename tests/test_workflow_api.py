@@ -7,9 +7,11 @@
 from __future__ import annotations
 
 import base64
+from io import BytesIO
 from pathlib import Path
 
 import pytest
+from docx import Document
 from fastapi.testclient import TestClient
 
 BOSS = {"Authorization": "Bearer boss-token-at-least-16"}
@@ -76,6 +78,39 @@ def test_auth_matrix_and_unified_error_structure(api) -> None:
     not_found = api.get("/files/does-not-exist-at-all")
     assert not_found.status_code == 404
     assert not_found.json()["error"]["code"] == "RESOURCE_NOT_FOUND"
+
+
+def test_structured_topic_import_api_accepts_non_template_word(api) -> None:
+    document = Document()
+    document.add_paragraph("这是一份没有固定标题样式的 ChatGPT 文档。")
+    document.add_paragraph("企业开始用智能代理处理重复性内容工作。")
+    buffer = BytesIO()
+    document.save(buffer)
+    encoded = base64.b64encode(buffer.getvalue()).decode()
+    body = {
+        "original_filename": "自由格式.docx",
+        "idempotency_key": "api-structured-0001",
+        "content_base64": encoded,
+        "topics": [
+            {
+                "title": "智能代理进入内容工作流",
+                "source_text": "企业开始用智能代理处理重复性内容工作。",
+                "script": None,
+                "confidence": 0.92,
+                "evidence": ["智能代理处理重复性内容工作"],
+            }
+        ],
+        "warnings": [],
+        "schema_version": "1.0",
+    }
+
+    imported = api.post("/internal/tools/import-structured-topics", headers=BOSS, json=body)
+    assert imported.status_code == 200
+    assert imported.json()["data"]["import_mode"] == "WORKBUDDY_STRUCTURED"
+    assert imported.json()["data"]["created_count"] == 1
+
+    forbidden = api.post("/internal/tools/import-structured-topics", headers=EMP_A, json=body)
+    assert forbidden.status_code == 403
 
 
 def test_full_topic_script_flow_through_internal_api(api) -> None:

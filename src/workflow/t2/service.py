@@ -3,8 +3,11 @@ from __future__ import annotations
 import hashlib
 import io
 import logging
+import re
 import secrets
+import unicodedata
 import uuid
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -51,13 +54,21 @@ from workflow.t2.allocation import (
     next_task_number,
 )
 from workflow.t2.calendar import effective_started_at, week_start_for
+from workflow.t2.contracts import StructuredTopicInput
 from workflow.t2.files import DOCUMENT_MIME_TYPES, receive_document
-from workflow.t2.parser import TopicParseError, parse_topic_document
+from workflow.t2.parser import TopicParseError, extract_document_text, parse_topic_document
 
 TOPIC_EXTENSIONS = {".docx"}
 SCRIPT_EXTENSIONS = {".docx", ".pdf", ".md", ".txt"}
 
 logger = logging.getLogger("workflow.t2")
+
+
+@dataclass(frozen=True, slots=True)
+class _ImportTopic:
+    source_sequence: int
+    title: str
+    source_content: dict[str, Any]
 
 
 class T2Service:
@@ -97,14 +108,165 @@ class T2Service:
             }
             for failure in parse_result.failures
         ]
+        prepared_topics = [
+            _ImportTopic(
+                source_sequence=topic.source_sequence,
+                title=topic.title,
+                source_content=topic.source_content,
+            )
+            for topic in topics
+        ]
+        return self._persist_topic_import(
+            actor_name=actor_name,
+            tool_name="import_topic_document",
+            original_filename=original_filename,
+            idempotency_key=idempotency_key,
+            content=content,
+            sha256=sha256,
+            topics=prepared_topics,
+            parse_report={
+                "import_mode": "RULE_BASED",
+                "schema_version": None,
+                "warnings": [],
+                "failures": failure_report,
+            },
+        )
+
+    def import_structured_topics(
+        self,
+        *,
+        actor_name: str,
+        original_filename: str,
+        idempotency_key: str,
+        topics: list[StructuredTopicInput],
+        warnings: list[str],
+        schema_version: str,
+        content_base64: str | None,
+        file_url: str | None,
+    ) -> dict[str, Any]:
+        content = receive_document(
+            filename=original_filename,
+            allowed=TOPIC_EXTENSIONS,
+            max_bytes=self.settings.max_topic_document_bytes,
+            content_base64=content_base64,
+            file_url=file_url,
+        )
+        sha256 = hashlib.sha256(content).hexdigest()
+        try:
+            document_text = extract_document_text(content)
+        except TopicParseError as exc:
+            raise InvalidArgument(str(exc)) from exc
+        normalized_document = self._normalize_source_text(document_text)
+        if not normalized_document:
+            raise InvalidArgument("Word 文件中没有可供校验的文本。")
+
+        prepared_topics: list[_ImportTopic] = []
+        validation_errors: list[str] = []
+        normalized_seen: set[tuple[str, str]] = set()
+        merged_warnings = [warning.strip() for warning in warnings if warning.strip()]
+        for ordinal, topic in enumerate(topics, start=1):
+            title = topic.title.strip()
+            source_text = topic.source_text.strip()
+            source_normalized = self._normalize_source_text(source_text)
+            label = topic.source_index or str(ordinal)
+            if not title or not source_normalized:
+                validation_errors.append(f"第 {label} 条缺少 title 或 source_text。")
+                continue
+            if source_normalized not in normalized_document:
+                validation_errors.append(f"第 {label} 条 source_text 无法在 Word 原文中定位。")
+            signature = (self._normalize_source_text(title).casefold(), source_normalized)
+            if signature in normalized_seen:
+                validation_errors.append(f"第 {label} 条与本次其他选题重复。")
+            normalized_seen.add(signature)
+
+            script = topic.script.strip() if topic.script else None
+            if script and self._normalize_source_text(script) not in normalized_document:
+                validation_errors.append(f"第 {label} 条 script 无法在 Word 原文中定位。")
+            for evidence_index, evidence in enumerate(topic.evidence, start=1):
+                if self._normalize_source_text(evidence) not in normalized_document:
+                    validation_errors.append(
+                        f"第 {label} 条 evidence[{evidence_index}] 无法在 Word 原文中定位。"
+                    )
+            if topic.confidence is not None and topic.confidence < 0.7:
+                merged_warnings.append(
+                    f"第 {label} 条模型置信度为 {topic.confidence:.2f}，建议老板重点复核。"
+                )
+            prepared_topics.append(
+                _ImportTopic(
+                    source_sequence=ordinal,
+                    title=title,
+                    source_content={
+                        "extraction_mode": "WORKBUDDY_STRUCTURED",
+                        "source_index": topic.source_index,
+                        "source_text": source_text,
+                        "script": script,
+                        "confidence": topic.confidence,
+                        "evidence": topic.evidence,
+                        "evidence_verified": True,
+                    },
+                )
+            )
+
+        if validation_errors:
+            detail = "；".join(validation_errors[:10])
+            if len(validation_errors) > 10:
+                detail += f"；另有 {len(validation_errors) - 10} 条错误"
+            raise InvalidArgument(f"结构化选题未通过 Word 原文校验：{detail}")
+
+        request_topics = [topic.model_dump(mode="json") for topic in topics]
+        return self._persist_topic_import(
+            actor_name=actor_name,
+            tool_name="import_structured_topics",
+            original_filename=original_filename,
+            idempotency_key=idempotency_key,
+            content=content,
+            sha256=sha256,
+            topics=prepared_topics,
+            parse_report={
+                "import_mode": "WORKBUDDY_STRUCTURED",
+                "schema_version": schema_version,
+                "warnings": merged_warnings,
+                "failures": [],
+                "source_verification": "PASSED",
+                "topic_count": len(prepared_topics),
+            },
+            request_payload={
+                "filename": original_filename,
+                "sha256": sha256,
+                "schema_version": schema_version,
+                "topics": request_topics,
+                "warnings": warnings,
+            },
+        )
+
+    @staticmethod
+    def _normalize_source_text(value: str) -> str:
+        normalized = unicodedata.normalize("NFKC", value)
+        return re.sub(r"\s+", " ", normalized).strip()
+
+    def _persist_topic_import(
+        self,
+        *,
+        actor_name: str,
+        tool_name: str,
+        original_filename: str,
+        idempotency_key: str,
+        content: bytes,
+        sha256: str,
+        topics: list[_ImportTopic],
+        parse_report: dict[str, Any],
+        request_payload: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        payload = request_payload or {"filename": original_filename, "sha256": sha256}
+        failure_report = list(parse_report.get("failures", []))
         with session_scope(self.sessions) as session:
             actor = self._actor(session, actor_name, Role.BOSS)
             replay = self._replay(
                 session,
                 actor,
-                "import_topic_document",
+                tool_name,
                 idempotency_key,
-                {"filename": original_filename, "sha256": sha256},
+                payload,
             )
             if replay is not None:
                 return replay
@@ -120,9 +282,9 @@ class T2Service:
                 replayed = self._save_idempotency(
                     session,
                     actor,
-                    "import_topic_document",
+                    tool_name,
                     idempotency_key,
-                    {"filename": original_filename, "sha256": sha256},
+                    payload,
                     response,
                 )
                 return replayed if replayed is not None else response
@@ -140,7 +302,7 @@ class T2Service:
                 source_attachment_id=attachment.id,
                 sha256=sha256,
                 parse_status="PROCESSING",
-                parse_report={"failures": failure_report},
+                parse_report=parse_report,
             )
             session.add(batch)
             session.flush()
@@ -246,9 +408,9 @@ class T2Service:
             replayed = self._save_idempotency(
                 session,
                 actor,
-                "import_topic_document",
+                tool_name,
                 idempotency_key,
-                {"filename": original_filename, "sha256": sha256},
+                payload,
                 response,
             )
             return replayed if replayed is not None else response
@@ -480,6 +642,20 @@ class T2Service:
                 "stage_task",
                 task.id,
                 {"priority": task.priority},
+            )
+            assignee = (
+                session.get(ActorProfile, task.assignee_id) if task.assignee_id else None
+            )
+            self._notify(
+                session,
+                actor.company_id,
+                "TASK_PRIORITY_CHANGED",
+                (
+                    f"任务 {task.task_no} 已设为优先处理"
+                    if priority
+                    else f"任务 {task.task_no} 已取消优先处理"
+                ),
+                [assignee.wecom_userid if assignee else None],
             )
             response = {
                 "success": True,
@@ -1528,6 +1704,9 @@ class T2Service:
             if duplicate_exists is not None:
                 duplicate_title_warnings.append(project.title)
         failures = list((batch.parse_report or {}).get("failures", []))
+        warnings = list((batch.parse_report or {}).get("warnings", []))
+        import_mode = (batch.parse_report or {}).get("import_mode", "RULE_BASED")
+        schema_version = (batch.parse_report or {}).get("schema_version")
         if deduplicated:
             user_message = "检测到相同文件，未重复创建任务。"
         elif batch.parse_status == "FAILED":
@@ -1546,6 +1725,9 @@ class T2Service:
                 "created_count": created_count,
                 "parse_status": batch.parse_status,
                 "pending_assignment_count": pending_assignment_count,
+                "import_mode": import_mode,
+                "schema_version": schema_version,
+                "warnings": warnings,
                 "failures": failures,
                 "tasks": tasks,
                 "duplicate_title_warnings": duplicate_title_warnings,

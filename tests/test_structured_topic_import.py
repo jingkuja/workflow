@@ -3,13 +3,11 @@ from __future__ import annotations
 import base64
 from io import BytesIO
 
-import pytest
 from docx import Document
-from sqlalchemy import func, select
+from sqlalchemy import select
 from test_t2_service_flow import make_service
 
-from workflow.db.models import ContentProject, ImportBatch
-from workflow.errors import InvalidArgument
+from workflow.db.models import ContentProject
 from workflow.t2.contracts import StructuredTopicInput
 
 
@@ -63,14 +61,14 @@ def test_structured_import_accepts_arbitrary_word_layout_and_deduplicates(tmp_pa
     assert data["parse_status"] == "COMPLETED"
     assert data["import_mode"] == "WORKBUDDY_STRUCTURED"
     assert data["schema_version"] == "1.0"
-    assert len(data["warnings"]) == 2
+    assert data["warnings"] == ["第二条需要确认数据时效。"]
 
     with service.sessions() as session:
         projects = session.scalars(
             select(ContentProject).order_by(ContentProject.source_sequence)
         ).all()
         assert projects[0].source_content["script"] is None
-        assert projects[0].source_content["evidence_verified"] is True
+        assert projects[0].source_content["source_verification"] == "SKIPPED"
         assert projects[1].source_content["confidence"] == 0.65
 
     duplicate = service.import_structured_topics(
@@ -87,29 +85,33 @@ def test_structured_import_accepts_arbitrary_word_layout_and_deduplicates(tmp_pa
     assert duplicate["data"]["created_count"] == 0
 
 
-def test_structured_import_rejects_hallucinated_source_without_writes(tmp_path) -> None:
+def test_structured_import_trusts_mcp_content_without_source_verification(tmp_path) -> None:
     service = make_service(tmp_path)
     encoded = base64.b64encode(_arbitrary_document()).decode()
 
-    with pytest.raises(InvalidArgument, match="无法在 Word 原文中定位"):
-        service.import_structured_topics(
-            actor_name="老板测试",
-            original_filename="任意格式.docx",
-            idempotency_key="structured-invalid-0001",
-            topics=[
-                StructuredTopicInput(
-                    title="模型幻觉",
-                    source_text="这段内容从未出现在原始 Word 文档中。",
-                    confidence=0.99,
-                    evidence=[],
-                )
-            ],
-            warnings=[],
-            schema_version="1.0",
-            content_base64=encoded,
-            file_url=None,
-        )
+    imported = service.import_structured_topics(
+        actor_name="老板测试",
+        original_filename="任意格式.docx",
+        idempotency_key="structured-trusted-0001",
+        topics=[
+            StructuredTopicInput(
+                title="MCP 生成的任务",
+                source_text="这段内容不要求能在原始 Word 文档中定位。",
+                script="MCP 也可以直接提供生成后的口播稿。",
+                confidence=0.2,
+                evidence=["模型整理的定位说明"],
+            )
+        ],
+        warnings=[],
+        schema_version="1.0",
+        content_base64=encoded,
+        file_url=None,
+    )
 
+    assert imported["data"]["created_count"] == 1
+    assert imported["data"]["warnings"] == []
     with service.sessions() as session:
-        assert session.scalar(select(func.count()).select_from(ImportBatch)) == 0
-        assert session.scalar(select(func.count()).select_from(ContentProject)) == 0
+        project = session.scalar(select(ContentProject))
+        assert project is not None
+        assert project.source_content["source_text"].startswith("这段内容不要求")
+        assert project.source_content["source_verification"] == "SKIPPED"

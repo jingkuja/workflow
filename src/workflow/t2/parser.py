@@ -96,11 +96,6 @@ def _document_lines(content: bytes) -> list[_Line]:
     return _iter_lines(document)
 
 
-def extract_document_text(content: bytes) -> str:
-    """提取 Word 中按阅读顺序排列的段落和表格文本，供结构化结果验真。"""
-    return "\n".join(line.text for line in _document_lines(content))
-
-
 def _split_blocks(lines: list[_Line]) -> list[tuple[int, str, list[_Line]]]:
     """以带序号一级标题为起点切块；无序号一级标题结束当前块。"""
     blocks: list[tuple[int, str, list[_Line]]] = []

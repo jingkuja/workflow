@@ -16,7 +16,7 @@
 - 企业微信事务发件箱及事件去重、重试和 DEAD 状态。
 - `storage_provider + storage_key` 附件模型、本地原子落盘和磁盘阈值保护。
 - 数据库备份、隔离恢复脚本和 Docker 日志轮转。
-- WorkBuddy 大模型结构化抽取任意排版 Word，后台原文验真、SHA-256 去重和并发唯一导入。
+- WorkBuddy 大模型结构化抽取任意排版 Word，后台信任 MCP 结果、保存原文件并完成去重入库。
 - 工作日生效规则、任务编号和按周工作量最小值随机分配。
 - 导入任务删除、改派、优先级以及老板/员工资源权限隔离。
 - `.docx`、`.pdf`、`.md`、`.txt` 演播稿多版本提交、驳回、重提和通过。
@@ -53,7 +53,7 @@ Nginx 使用 Docker DNS 动态解析 MCP/API 上游，应用容器重建后不�
 
 WorkBuddy 应配置完整入口 `/mcp/boss` 或 `/mcp/employee`，不要使用 `/mcp`。
 老板上传普通 `.docx` 时应优先调用 `import_structured_topics`：WorkBuddy 负责理解
-文档并生成结构化选题，后台负责逐项原文校验、保存源文件、去重、分配和审计。
+文档并生成结构化选题，后台直接保存任务与原文件，并负责去重、分配和审计。
 `import_topic_document` 仅保留给旧的固定标题模板。
 
 ## 开发与测试

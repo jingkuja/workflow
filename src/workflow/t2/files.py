@@ -6,7 +6,11 @@ import http.client
 import ipaddress
 import socket
 import ssl
+import tempfile
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path, PurePath
+from typing import BinaryIO
 from urllib.parse import urljoin, urlsplit
 
 from workflow.errors import (
@@ -66,20 +70,45 @@ def validate_signature(content: bytes, extension: str) -> None:
 
 
 def download_document(url: str, *, filename: str, allowed: set[str], max_bytes: int) -> bytes:
+    with open_downloaded_document(
+        url,
+        filename=filename,
+        allowed=allowed,
+        max_bytes=max_bytes,
+    ) as stream:
+        return stream.read()
+
+
+@contextmanager
+def open_downloaded_document(
+    url: str,
+    *,
+    filename: str,
+    allowed: set[str],
+    max_bytes: int,
+) -> Iterator[BinaryIO]:
     extension = validate_filename(filename, allowed)
     current = url
-    for _ in range(_MAX_REDIRECTS):
-        status, location, content = _fetch_https_pinned(current, max_bytes=max_bytes)
-        if status in _REDIRECT_STATUSES:
-            if not location:
-                raise ExternalDependencyFailed("文件 URL 重定向缺少 Location。")
-            current = urljoin(current, location)
-            continue
-        if status != 200:
-            raise ExternalDependencyFailed(f"文件 URL 返回 HTTP {status}。")
-        validate_signature(content, extension)
-        return content
-    raise ExternalDependencyFailed("文件 URL 重定向次数超过限制。")
+    with tempfile.SpooledTemporaryFile(max_size=_DOWNLOAD_CHUNK) as stream:
+        for _ in range(_MAX_REDIRECTS):
+            status, location = _fetch_https_pinned_into(
+                current,
+                target=stream,
+                max_bytes=max_bytes,
+            )
+            if status in _REDIRECT_STATUSES:
+                if not location:
+                    raise ExternalDependencyFailed("文件 URL 重定向缺少 Location。")
+                current = urljoin(current, location)
+                continue
+            if status != 200:
+                raise ExternalDependencyFailed(f"文件 URL 返回 HTTP {status}。")
+            stream.seek(0)
+            validate_signature(stream.read(4096), extension)
+            stream.seek(0)
+            yield stream
+            return
+        raise ExternalDependencyFailed("文件 URL 重定向次数超过限制。")
 
 
 def receive_document(
@@ -143,10 +172,28 @@ def _resolve_public_ips(hostname: str, port: int) -> list[str]:
 
 
 def _fetch_https_pinned(url: str, *, max_bytes: int) -> tuple[int, str | None, bytes]:
+    with tempfile.SpooledTemporaryFile(max_size=_DOWNLOAD_CHUNK) as stream:
+        status, location = _fetch_https_pinned_into(
+            url,
+            target=stream,
+            max_bytes=max_bytes,
+        )
+        stream.seek(0)
+        return status, location, stream.read()
+
+
+def _fetch_https_pinned_into(
+    url: str,
+    *,
+    target: BinaryIO,
+    max_bytes: int,
+) -> tuple[int, str | None]:
     host, port, path = _parse_https_url(url)
     ips = _resolve_public_ips(host, port)
     last_error: Exception | None = None
     for ip in ips:
+        target.seek(0)
+        target.truncate()
         connection = _PinnedHTTPSConnection(host, ip, port, timeout=20.0)
         try:
             connection.connect()
@@ -156,8 +203,9 @@ def _fetch_https_pinned(url: str, *, max_bytes: int) -> tuple[int, str | None, b
             response = connection.getresponse()
             status = response.status
             if status in _REDIRECT_STATUSES:
-                response.read()
-                return status, response.getheader("Location"), b""
+                return status, response.getheader("Location")
+            if status != 200:
+                return status, None
             content_length = response.getheader("Content-Length")
             if (
                 content_length is not None
@@ -165,18 +213,17 @@ def _fetch_https_pinned(url: str, *, max_bytes: int) -> tuple[int, str | None, b
                 and int(content_length) > max_bytes
             ):
                 raise FileTooLarge(f"下载文件超过技术上限 {max_bytes} 字节。")
-            chunks: list[bytes] = []
             remaining = max_bytes + 1
             while remaining > 0:
                 chunk = response.read(min(_DOWNLOAD_CHUNK, remaining))
                 if not chunk:
                     break
-                chunks.append(chunk)
+                target.write(chunk)
                 remaining -= len(chunk)
-            content = b"".join(chunks)
-            if len(content) > max_bytes:
+            if target.tell() > max_bytes:
                 raise FileTooLarge(f"下载文件超过技术上限 {max_bytes} 字节。")
-            return status, None, content
+            target.seek(0)
+            return status, None
         except (InvalidArgument, FileTooLarge):
             raise
         except (OSError, http.client.HTTPException, ssl.SSLError) as exc:

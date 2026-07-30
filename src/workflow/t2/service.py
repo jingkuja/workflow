@@ -5,10 +5,12 @@ import io
 import logging
 import secrets
 import uuid
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, BinaryIO
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import func, select
@@ -53,7 +55,7 @@ from workflow.t2.allocation import (
 )
 from workflow.t2.calendar import effective_started_at, week_start_for
 from workflow.t2.contracts import StructuredTopicInput
-from workflow.t2.files import DOCUMENT_MIME_TYPES, download_document
+from workflow.t2.files import DOCUMENT_MIME_TYPES, open_downloaded_document
 from workflow.t2.parser import TopicParseError, parse_topic_document
 from workflow.uploads import McpUploadService
 
@@ -274,7 +276,7 @@ class T2Service:
                 company_id=actor.company_id,
                 purpose="topic-source",
                 original_filename=original_filename,
-                content=content,
+                stream=io.BytesIO(content),
             )
             batch = ImportBatch(
                 company_id=actor.company_id,
@@ -301,13 +303,29 @@ class T2Service:
             created = 0
             pending_assignment = 0
             assigned_tasks: dict[str, tuple[ActorProfile, list[tuple[str, str]]]] = {}
+            initial_loads = employee_loads(
+                session, actor.company_id, effective, self.settings.app_timezone
+            )
+            eligible_employees = [employee for employee, _ in initial_loads]
+            load_by_employee_id = {
+                employee.id: count for employee, count in initial_loads
+            }
             for topic in topics:
-                loads = employee_loads(
-                    session, actor.company_id, effective, self.settings.app_timezone
-                )
                 # 规格 §4.3：暂时没有可用员工时任务进入 PENDING_ASSIGNMENT，
                 # 不阻断整批导入；老板可稍后通过改派指定负责人。
-                assignee = choose_employee(loads) if loads else None
+                assignee = (
+                    choose_employee(
+                        [
+                            (employee, load_by_employee_id[employee.id])
+                            for employee in eligible_employees
+                        ]
+                    )
+                    if eligible_employees
+                    else None
+                )
+                if assignee is not None:
+                    # 本批次的增量在事务内显式维护，不能依赖 ORM autoflush 后重新 SUM。
+                    load_by_employee_id[assignee.id] += 1
                 project = ContentProject(
                     company_id=actor.company_id,
                     import_batch_id=batch.id,
@@ -431,8 +449,9 @@ class T2Service:
                 "IN_PROGRESS",
                 "REJECTED",
                 "PENDING_ASSIGNMENT",
+                "SUBMITTED",
             }:
-                raise InvalidStateTransition("该任务已提交或进入后续阶段，不能从导入列表删除。")
+                raise InvalidStateTransition("该任务已完成或进入后续阶段，不能从导入列表删除。")
             previous_assignee = (
                 session.get(ActorProfile, task.assignee_id) if task.assignee_id else None
             )
@@ -1108,7 +1127,7 @@ class T2Service:
         file_url: str | None,
         note: str | None,
     ) -> dict[str, Any]:
-        content = self._receive_document(
+        with self._open_document(
             actor_name=actor_name,
             role=Role.EMPLOYEE,
             filename=original_filename,
@@ -1116,8 +1135,29 @@ class T2Service:
             max_bytes=self.settings.max_script_document_bytes,
             file_key=file_key,
             file_url=file_url,
-        )
-        sha256 = hashlib.sha256(content).hexdigest()
+        ) as document:
+            sha256 = self._stream_sha256(document)
+            return self._submit_script_stream(
+                actor_name=actor_name,
+                task_no=task_no,
+                original_filename=original_filename,
+                idempotency_key=idempotency_key,
+                note=note,
+                sha256=sha256,
+                document=document,
+            )
+
+    def _submit_script_stream(
+        self,
+        *,
+        actor_name: str,
+        task_no: str,
+        original_filename: str,
+        idempotency_key: str,
+        note: str | None,
+        sha256: str,
+        document: BinaryIO,
+    ) -> dict[str, Any]:
         payload = {
             "task_no": task_no,
             "filename": original_filename,
@@ -1146,12 +1186,13 @@ class T2Service:
             }:
                 raise InvalidStateTransition("当前任务状态不允许提交演播稿。")
             project = session.get(ContentProject, task.project_id)
+            document.seek(0)
             attachment = self._store_attachment(
                 session,
                 company_id=actor.company_id,
                 purpose="script",
                 original_filename=original_filename,
-                content=content,
+                stream=document,
             )
             version_no = (
                 session.scalar(
@@ -1544,7 +1585,12 @@ class T2Service:
                 session,
                 actor.company_id,
                 f"SCRIPT_{decision}",
-                f"演播稿 {task.task_no} 审核结果：{decision}",
+                (
+                    f"演播稿 {task.task_no} 审核结果：REJECTED。"
+                    "请按审核意见修改后重新提交。"
+                    if decision == "REJECTED"
+                    else f"演播稿 {task.task_no} 审核结果：APPROVED"
+                ),
                 [assignee.wecom_userid if assignee else None],
             )
             response = {
@@ -1558,6 +1604,9 @@ class T2Service:
                 "user_message": "演播稿已通过。"
                 if decision == "APPROVED"
                 else "演播稿已驳回，原员工可修改后重提。",
+                "next_actions": []
+                if decision == "APPROVED"
+                else ["get_my_task", "submit_script_file"],
             }
             replayed = self._save_idempotency(
                 session,
@@ -1634,11 +1683,11 @@ class T2Service:
         company_id: str,
         purpose: str,
         original_filename: str,
-        content: bytes,
+        stream: BinaryIO,
     ) -> Attachment:
         attachment_id = str(uuid.uuid4())
         stored = self.storage.put(
-            io.BytesIO(content),
+            stream,
             company_id=company_id,
             purpose=purpose,
             attachment_id=attachment_id,
@@ -1661,6 +1710,55 @@ class T2Service:
         session.flush()
         return attachment
 
+    @staticmethod
+    def _stream_sha256(stream: BinaryIO) -> str:
+        digest = hashlib.sha256()
+        stream.seek(0)
+        while chunk := stream.read(1024 * 1024):
+            digest.update(chunk)
+        stream.seek(0)
+        return digest.hexdigest()
+
+    @contextmanager
+    def _open_document(
+        self,
+        *,
+        actor_name: str,
+        role: Role,
+        filename: str,
+        allowed: set[str],
+        max_bytes: int,
+        file_key: str | None,
+        file_url: str | None,
+    ) -> Iterator[BinaryIO]:
+        if (file_key is None) == (file_url is None):
+            raise InvalidArgument("file_key 与 file_url 必须二选一。")
+        if file_url is not None:
+            with open_downloaded_document(
+                file_url,
+                filename=filename,
+                allowed=allowed,
+                max_bytes=max_bytes,
+            ) as stream:
+                yield stream
+            return
+        with session_scope(self.sessions) as session:
+            actor = self._actor(session, actor_name, role)
+            path = self.uploads.document_path(
+                session,
+                actor=actor,
+                file_key=file_key or "",
+                filename=filename,
+                allowed=allowed,
+                max_bytes=max_bytes,
+            )
+        try:
+            stream = path.open("rb")
+        except OSError as exc:
+            raise ResourceNotFound("预上传文件内容已不可用，请重新上传。") from exc
+        with stream:
+            yield stream
+
     def _receive_document(
         self,
         *,
@@ -1672,25 +1770,16 @@ class T2Service:
         file_key: str | None,
         file_url: str | None,
     ) -> bytes:
-        if (file_key is None) == (file_url is None):
-            raise InvalidArgument("file_key 与 file_url 必须二选一。")
-        if file_url is not None:
-            return download_document(
-                file_url,
-                filename=filename,
-                allowed=allowed,
-                max_bytes=max_bytes,
-            )
-        with session_scope(self.sessions) as session:
-            actor = self._actor(session, actor_name, role)
-            return self.uploads.read_document(
-                session,
-                actor=actor,
-                file_key=file_key or "",
-                filename=filename,
-                allowed=allowed,
-                max_bytes=max_bytes,
-            )
+        with self._open_document(
+            actor_name=actor_name,
+            role=role,
+            filename=filename,
+            allowed=allowed,
+            max_bytes=max_bytes,
+            file_key=file_key,
+            file_url=file_url,
+        ) as stream:
+            return stream.read()
 
     def _import_response(
         self,
@@ -1774,7 +1863,11 @@ class T2Service:
                 "report_task_blocker",
             ]
         elif task.status == "SUBMITTED":
-            next_actions = ["review_script_submission", "set_task_priority"]
+            next_actions = [
+                "review_script_submission",
+                "set_task_priority",
+                "delete_imported_task",
+            ]
         else:
             # APPROVED/WAITING_FOR_FILMING 是 T4 当前正常终态；不暴露 T3 动作。
             next_actions = []

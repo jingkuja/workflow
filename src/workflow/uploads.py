@@ -3,8 +3,8 @@ from __future__ import annotations
 import base64
 import binascii
 import hashlib
-import io
 import uuid
+from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -16,6 +16,26 @@ from workflow.db.models import ActorProfile, McpFileUpload
 from workflow.errors import FileProcessingFailed, FileTooLarge, InvalidArgument, ResourceNotFound
 from workflow.storage import LocalStorage
 from workflow.t2.files import validate_filename, validate_signature
+
+_BASE64_CHUNK_CHARS = 1024 * 1024
+
+
+def _base64_decoded_size(encoded: str) -> int:
+    if len(encoded) % 4:
+        raise InvalidArgument("Base64 内容格式错误。")
+    padding = 2 if encoded.endswith("==") else 1 if encoded.endswith("=") else 0
+    body_end = len(encoded) - padding if padding else len(encoded)
+    if padding > 2 or "=" in encoded[:body_end]:
+        raise InvalidArgument("Base64 内容格式错误。")
+    return len(encoded) // 4 * 3 - padding
+
+
+def _iter_base64_decoded(encoded: str) -> Iterator[bytes]:
+    for offset in range(0, len(encoded), _BASE64_CHUNK_CHARS):
+        yield base64.b64decode(
+            encoded[offset : offset + _BASE64_CHUNK_CHARS],
+            validate=True,
+        )
 
 
 class McpUploadService:
@@ -42,23 +62,22 @@ class McpUploadService:
     ) -> dict[str, object]:
         if file_base64.startswith("data:"):
             raise InvalidArgument("请传入纯 Base64，不要使用 data URI。")
-        estimated_size = len(file_base64) * 3 // 4
-        if estimated_size > self.max_bytes:
+        decoded_size = _base64_decoded_size(file_base64)
+        if decoded_size > self.max_bytes:
             raise FileTooLarge(f"文件超过技术上限 {self.max_bytes} 字节。")
+        upload_id = str(uuid.uuid4())
         try:
-            content = base64.b64decode(file_base64, validate=True)
+            stored = self.storage.put_chunks(
+                _iter_base64_decoded(file_base64),
+                company_id=actor.company_id,
+                purpose="mcp-upload",
+                attachment_id=upload_id,
+            )
         except (binascii.Error, ValueError) as exc:
             raise InvalidArgument("Base64 内容格式错误。") from exc
-        if len(content) > self.max_bytes:
+        if stored.size_bytes > self.max_bytes:
             raise FileTooLarge(f"文件超过技术上限 {self.max_bytes} 字节。")
 
-        upload_id = str(uuid.uuid4())
-        stored = self.storage.put(
-            io.BytesIO(content),
-            company_id=actor.company_id,
-            purpose="mcp-upload",
-            attachment_id=upload_id,
-        )
         expires_at = datetime.now(UTC) + timedelta(hours=self.settings.mcp_upload_ttl_hours)
         upload = McpFileUpload(
             id=upload_id,
@@ -100,6 +119,29 @@ class McpUploadService:
         allowed: set[str],
         max_bytes: int,
     ) -> bytes:
+        path = self.document_path(
+            session,
+            actor=actor,
+            file_key=file_key,
+            filename=filename,
+            allowed=allowed,
+            max_bytes=max_bytes,
+        )
+        try:
+            return path.read_bytes()
+        except OSError as exc:
+            raise FileProcessingFailed("预上传文件内容已不可用，请重新上传。") from exc
+
+    def document_path(
+        self,
+        session: Session,
+        *,
+        actor: ActorProfile,
+        file_key: str,
+        filename: str,
+        allowed: set[str],
+        max_bytes: int,
+    ) -> Path:
         extension = validate_filename(filename, allowed)
         upload = session.scalar(
             select(McpFileUpload).where(
@@ -119,13 +161,18 @@ class McpUploadService:
             raise FileTooLarge(f"文件超过该业务工具的技术上限 {max_bytes} 字节。")
         try:
             path = self.storage.path_for(upload.storage_key)
-            content = Path(path).read_bytes()
+            digest = hashlib.sha256()
+            size = 0
+            signature = b""
+            with path.open("rb") as source:
+                while chunk := source.read(1024 * 1024):
+                    if not signature:
+                        signature = chunk[:4096]
+                    digest.update(chunk)
+                    size += len(chunk)
         except OSError as exc:
             raise FileProcessingFailed("预上传文件内容已不可用，请重新上传。") from exc
-        if (
-            len(content) != upload.size_bytes
-            or hashlib.sha256(content).hexdigest() != upload.sha256
-        ):
+        if size != upload.size_bytes or digest.hexdigest() != upload.sha256:
             raise FileProcessingFailed("预上传文件完整性校验失败，请重新上传。")
-        validate_signature(content, extension)
-        return content
+        validate_signature(signature, extension)
+        return path

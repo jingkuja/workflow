@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+from collections import Counter
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -94,8 +95,19 @@ def test_uploaded_file_key_is_bound_to_actor_and_expiry(tmp_path: Path) -> None:
         )
 
 
-def test_t2_full_topic_script_workflow(tmp_path: Path) -> None:
+def test_t2_full_topic_script_workflow(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import workflow.t2.service as service_module
+
     service = make_service(tmp_path)
+    load_query_count = 0
+    original_employee_loads = service_module.employee_loads
+
+    def counted_employee_loads(*args, **kwargs):
+        nonlocal load_query_count
+        load_query_count += 1
+        return original_employee_loads(*args, **kwargs)
+
+    monkeypatch.setattr(service_module, "employee_loads", counted_employee_loads)
     document = Path("docs/AI行业选题文档上传样例.docx").read_bytes()
     topic_file_key = upload_file(
         service, actor_name="老板测试", role="BOSS", content=document
@@ -114,7 +126,8 @@ def test_t2_full_topic_script_workflow(tmp_path: Path) -> None:
     assert imported["data"]["failures"] == []
     assert imported["data"]["pending_assignment_count"] == 0
     names = [task["assigned_employee_name"] for task in tasks]
-    assert abs(names.count("员工甲") - names.count("员工乙")) <= 1
+    assert Counter(names) == {"员工甲": 5, "员工乙": 5}
+    assert load_query_count == 1
     with session_scope(service.sessions) as session:
         notifications = session.scalars(select(Notification)).all()
         assert len(notifications) == 2
@@ -144,15 +157,21 @@ def test_t2_full_topic_script_workflow(tmp_path: Path) -> None:
         role="EMPLOYEE",
         content="第一版".encode(),
     )
-    submitted = service.submit_script(
-        actor_name=owner,
-        task_no=target["task_no"],
-        original_filename="演播稿.txt",
-        idempotency_key="submit-key-0001",
-        file_key=first_script_key,
-        file_url=None,
-        note="初稿",
-    )
+    with monkeypatch.context() as submit_patch:
+        submit_patch.setattr(
+            Path,
+            "read_bytes",
+            lambda _path: pytest.fail("演播稿提交不应完整读取预上传文件"),
+        )
+        submitted = service.submit_script(
+            actor_name=owner,
+            task_no=target["task_no"],
+            original_filename="演播稿.txt",
+            idempotency_key="submit-key-0001",
+            file_key=first_script_key,
+            file_url=None,
+            note="初稿",
+        )
     replay = service.submit_script(
         actor_name=owner,
         task_no=target["task_no"],
@@ -172,6 +191,13 @@ def test_t2_full_topic_script_workflow(tmp_path: Path) -> None:
         idempotency_key="review-key-0001",
     )
     assert rejected["data"]["task_status"] == "REJECTED"
+    assert rejected["next_actions"] == ["get_my_task", "submit_script_file"]
+    with session_scope(service.sessions) as session:
+        notification = session.scalar(
+            select(Notification).where(Notification.template == "SCRIPT_REJECTED")
+        )
+        assert notification is not None
+        assert "修改后重新提交" in str(notification.payload["content"])
     second_script_key = upload_file(
         service,
         actor_name=owner,
@@ -233,6 +259,49 @@ def test_t2_full_topic_script_workflow(tmp_path: Path) -> None:
         item for item in cancelled["data"]["tasks"] if item["task_no"] == tasks[2]["task_no"]
     )
     assert cancelled_task["status"] == "CANCELLED"
+
+
+def test_upload_base64_streams_decoded_chunks_to_storage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import workflow.uploads as uploads_module
+
+    service = make_service(tmp_path)
+    content = b"x" * (1024 * 1024)
+    decode_calls = 0
+    original_decode = uploads_module.base64.b64decode
+
+    def counted_decode(*args, **kwargs):
+        nonlocal decode_calls
+        decode_calls += 1
+        return original_decode(*args, **kwargs)
+
+    def fail_buffered_put(*args, **kwargs):
+        raise AssertionError("upload_file 不应先构造完整 bytes 再调用 put")
+
+    monkeypatch.setattr(uploads_module.base64, "b64decode", counted_decode)
+    monkeypatch.setattr(service.uploads.storage, "put", fail_buffered_put)
+
+    file_key = upload_file(
+        service,
+        actor_name="员工甲",
+        role="EMPLOYEE",
+        content=content,
+    )
+
+    assert decode_calls >= 2
+    assert (
+        service._receive_document(
+            actor_name="员工甲",
+            role="EMPLOYEE",
+            filename="大文件.txt",
+            allowed={".txt"},
+            max_bytes=len(content),
+            file_key=file_key,
+            file_url=None,
+        )
+        == content
+    )
 
 
 def test_import_without_employees_creates_pending_assignment_tasks(tmp_path: Path) -> None:

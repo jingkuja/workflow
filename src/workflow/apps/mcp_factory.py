@@ -174,7 +174,7 @@ def create_mcp_server(settings: Settings, role: Role) -> FastMCP:
                 payload={"import_batch_id": import_batch_id},
             )
 
-        @mcp.tool(name="delete_imported_task", description="软删除尚未提交的导入任务。")
+        @mcp.tool(name="delete_imported_task", description="取消尚未完成的导入任务。")
         def delete_imported_task(
             task_no: str,
             idempotency_key: str,

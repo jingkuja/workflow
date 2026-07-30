@@ -77,7 +77,7 @@ def test_t4_dashboard_pagination_timeline_and_terminal_state(tmp_path: Path) -> 
     }
     assert "next_page" in first_page["next_actions"]
 
-    task = tasks[0]
+    task = next(item for item in tasks if item["assigned_employee_name"] == "员工甲")
     service.set_priority(
         actor_name="老板测试",
         task_no=str(task["task_no"]),
@@ -86,6 +86,29 @@ def test_t4_dashboard_pagination_timeline_and_terminal_state(tmp_path: Path) -> 
     )
     with session_scope(service.sessions) as session:
         assert session.scalar(select(func.count()).select_from(Notification)) == 3
+        priority_notification = session.scalar(
+            select(Notification).where(
+                Notification.template == "TASK_PRIORITY_CHANGED"
+            )
+        )
+        assert priority_notification is not None
+        assert priority_notification.mentioned_userids == ["userid-a"]
+        assert "已设为优先处理" in str(priority_notification.payload["content"])
+    service.set_priority(
+        actor_name="老板测试",
+        task_no=str(task["task_no"]),
+        priority=True,
+        idempotency_key="t4-priority-0001",
+    )
+    with session_scope(service.sessions) as session:
+        assert (
+            session.scalar(
+                select(func.count())
+                .select_from(Notification)
+                .where(Notification.template == "TASK_PRIORITY_CHANGED")
+            )
+            == 1
+        )
 
     employee_name = str(task["assigned_employee_name"])
     script_file_key = upload_file(
@@ -134,6 +157,51 @@ def test_t4_dashboard_pagination_timeline_and_terminal_state(tmp_path: Path) -> 
     assert dashboard["this_week"]["target_min"] == 35
     assert dashboard["this_week"]["gap_to_min"] >= 34
     assert len(dashboard["employee_loads"]) == 2
+
+
+def test_boss_can_cancel_submitted_task_awaiting_review(tmp_path: Path) -> None:
+    service = make_service(tmp_path)
+    task = import_sample(service)[0]
+    employee_name = str(task["assigned_employee_name"])
+    script_file_key = upload_file(
+        service,
+        actor_name=employee_name,
+        role="EMPLOYEE",
+        content="待审核演播稿".encode(),
+    )
+    service.submit_script(
+        actor_name=employee_name,
+        task_no=str(task["task_no"]),
+        original_filename="待审核.txt",
+        idempotency_key="cancel-submitted-submit-0001",
+        file_key=script_file_key,
+        file_url=None,
+        note=None,
+    )
+    pending = service.pending_reviews(actor_name="老板测试")
+    assert pending["pagination"]["total_items"] == 1
+    assert "delete_imported_task" in pending["data"][0]["next_actions"]
+
+    cancelled = service.cancel_imported_task(
+        actor_name="老板测试",
+        task_no=str(task["task_no"]),
+        reason="老板取消待审核任务",
+        idempotency_key="cancel-submitted-0001",
+    )
+
+    cancelled_task = next(
+        item
+        for item in cancelled["data"]["tasks"]
+        if item["task_no"] == task["task_no"]
+    )
+    assert cancelled_task["status"] == "CANCELLED"
+    assert service.pending_reviews(actor_name="老板测试")["pagination"]["total_items"] == 0
+    with session_scope(service.sessions) as session:
+        notification = session.scalar(
+            select(Notification).where(Notification.template == "TASK_CANCELLED")
+        )
+        assert notification is not None
+        assert f"任务 {task['task_no']} 已取消" == notification.payload["content"]
 
 
 def test_t4_blockers_and_failed_operations_are_queryable(tmp_path: Path) -> None:

@@ -4,6 +4,7 @@ import hashlib
 import os
 import secrets
 import shutil
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import BinaryIO
@@ -39,6 +40,21 @@ class LocalStorage:
     def put(
         self, stream: BinaryIO, *, company_id: str, purpose: str, attachment_id: str
     ) -> StoredFile:
+        return self.put_chunks(
+            iter(lambda: stream.read(1024 * 1024), b""),
+            company_id=company_id,
+            purpose=purpose,
+            attachment_id=attachment_id,
+        )
+
+    def put_chunks(
+        self,
+        chunks: Iterable[bytes],
+        *,
+        company_id: str,
+        purpose: str,
+        attachment_id: str,
+    ) -> StoredFile:
         self.ensure_capacity()
         opaque_id = secrets.token_urlsafe(24)
         storage_key = f"{purpose}/{company_id}/{attachment_id}/content"
@@ -49,7 +65,9 @@ class LocalStorage:
         size = 0
         try:
             with temp.open("wb") as target:
-                while chunk := stream.read(1024 * 1024):
+                for chunk in chunks:
+                    if not chunk:
+                        continue
                     digest.update(chunk)
                     size += len(chunk)
                     target.write(chunk)

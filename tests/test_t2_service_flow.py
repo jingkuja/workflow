@@ -9,7 +9,7 @@ from pydantic import SecretStr
 from sqlalchemy import select
 
 from workflow.config import Role, Settings
-from workflow.db.models import Base, McpFileUpload
+from workflow.db.models import Base, McpFileUpload, Notification
 from workflow.db.session import make_session_factory, session_scope
 from workflow.errors import ResourceNotFound
 from workflow.identity import sync_actor_profiles
@@ -115,6 +115,12 @@ def test_t2_full_topic_script_workflow(tmp_path: Path) -> None:
     assert imported["data"]["pending_assignment_count"] == 0
     names = [task["assigned_employee_name"] for task in tasks]
     assert abs(names.count("员工甲") - names.count("员工乙")) <= 1
+    with session_scope(service.sessions) as session:
+        notifications = session.scalars(select(Notification)).all()
+        assert len(notifications) == 2
+        assert all("共 5 条" in str(item.payload["content"]) for item in notifications)
+        combined_content = "\n".join(str(item.payload["content"]) for item in notifications)
+        assert all(combined_content.count(str(task["task_no"])) == 1 for task in tasks)
 
     duplicate = service.import_topics(
         actor_name="老板测试",

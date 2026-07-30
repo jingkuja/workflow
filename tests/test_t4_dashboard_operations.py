@@ -85,7 +85,7 @@ def test_t4_dashboard_pagination_timeline_and_terminal_state(tmp_path: Path) -> 
         idempotency_key="t4-priority-0001",
     )
     with session_scope(service.sessions) as session:
-        assert session.scalar(select(func.count()).select_from(Notification)) == 11
+        assert session.scalar(select(func.count()).select_from(Notification)) == 3
 
     employee_name = str(task["assigned_employee_name"])
     script_file_key = upload_file(

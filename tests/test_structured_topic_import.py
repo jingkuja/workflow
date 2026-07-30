@@ -6,7 +6,7 @@ from docx import Document
 from sqlalchemy import select
 from test_t2_service_flow import make_service, upload_file
 
-from workflow.db.models import ContentProject
+from workflow.db.models import ContentProject, ImportBatch
 from workflow.t2.contracts import StructuredTopicInput
 
 
@@ -71,6 +71,10 @@ def test_structured_import_accepts_arbitrary_word_layout_and_deduplicates(tmp_pa
         assert projects[0].source_content["script"] is None
         assert projects[0].source_content["source_verification"] == "SKIPPED"
         assert projects[1].source_content["confidence"] == 0.65
+        # 兼容恢复该规则前已经保存的复合批次 hash；源文件 hash 仍保存在解析报告中。
+        batch = session.scalar(select(ImportBatch))
+        assert batch is not None
+        batch.sha256 = "f" * 64
 
     duplicate = service.import_structured_topics(
         actor_name="老板测试",
@@ -103,8 +107,9 @@ def test_structured_import_accepts_arbitrary_word_layout_and_deduplicates(tmp_pa
         file_key=file_key,
         file_url=None,
     )
-    assert changed_extraction["data"]["deduplicated"] is False
-    assert changed_extraction["data"]["created_count"] == 1
+    assert changed_extraction["data"]["deduplicated"] is True
+    assert changed_extraction["data"]["created_count"] == 0
+    assert len(changed_extraction["data"]["tasks"]) == 2
 
 
 def test_structured_import_trusts_mcp_content_without_source_verification(tmp_path) -> None:

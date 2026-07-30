@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import hashlib
 import io
-import json
 import logging
 import secrets
 import uuid
@@ -190,27 +189,15 @@ class T2Service:
         ]
 
         request_topics = [topic.model_dump(mode="json") for topic in topics]
-        # 结构化导入的任务事实由 MCP 结果决定。同一原文件可能被重新抽取为不同
-        # 任务集合，因此批次去重必须同时包含文件内容和结构化任务，而不能只看文件。
-        batch_sha256 = hashlib.sha256(
-            json.dumps(
-                {
-                    "source_sha256": source_sha256,
-                    "schema_version": schema_version,
-                    "topics": request_topics,
-                },
-                ensure_ascii=False,
-                sort_keys=True,
-                separators=(",", ":"),
-            ).encode()
-        ).hexdigest()
+        # 导入批次只按原文件内容去重。同一文件即使被 MCP 重新抽取出不同任务，
+        # 也必须返回原批次，避免重复导入、分配和通知。
         return self._persist_topic_import(
             actor_name=actor_name,
             tool_name="import_structured_topics",
             original_filename=original_filename,
             idempotency_key=idempotency_key,
             content=content,
-            sha256=batch_sha256,
+            sha256=source_sha256,
             topics=prepared_topics,
             parse_report={
                 "import_mode": "WORKBUDDY_STRUCTURED",
@@ -224,7 +211,6 @@ class T2Service:
             request_payload={
                 "filename": original_filename,
                 "source_sha256": source_sha256,
-                "batch_sha256": batch_sha256,
                 "schema_version": schema_version,
                 "topics": request_topics,
                 "warnings": warnings,
@@ -259,10 +245,16 @@ class T2Service:
                 return replay
             advisory_lock(session, f"import:{actor.company_id}:{sha256}")
             existing = session.scalar(
-                select(ImportBatch).where(
+                select(ImportBatch)
+                .where(
                     ImportBatch.company_id == actor.company_id,
-                    ImportBatch.sha256 == sha256,
+                    (
+                        (ImportBatch.sha256 == sha256)
+                        | (ImportBatch.parse_report["source_sha256"].as_string() == sha256)
+                    ),
                 )
+                .order_by(ImportBatch.created_at, ImportBatch.id)
+                .limit(1)
             )
             if existing is not None:
                 response = self._import_response(session, existing, True, 0)
@@ -308,6 +300,7 @@ class T2Service:
             )
             created = 0
             pending_assignment = 0
+            assigned_tasks: dict[str, tuple[ActorProfile, list[tuple[str, str]]]] = {}
             for topic in topics:
                 loads = employee_loads(
                     session, actor.company_id, effective, self.settings.app_timezone
@@ -351,12 +344,8 @@ class T2Service:
                             assigned_at=now,
                         )
                     )
-                    self._notify(
-                        session,
-                        actor.company_id,
-                        "TASK_CREATED",
-                        f"新任务 {task.task_no}：{project.title}",
-                        [assignee.wecom_userid],
+                    assigned_tasks.setdefault(assignee.id, (assignee, []))[1].append(
+                        (task.task_no, project.title)
                     )
                 else:
                     pending_assignment += 1
@@ -373,6 +362,21 @@ class T2Service:
                     },
                 )
                 created += 1
+            for assignee, task_items in assigned_tasks.values():
+                task_lines = "\n".join(
+                    f"{index}. {task_no}：{title}"
+                    for index, (task_no, title) in enumerate(task_items, start=1)
+                )
+                self._notify(
+                    session,
+                    actor.company_id,
+                    "TASK_CREATED",
+                    (
+                        f"新任务分派（批次 {batch.id}），共 {len(task_items)} 条：\n"
+                        f"{task_lines}"
+                    ),
+                    [assignee.wecom_userid],
+                )
             batch.success_count = created
             batch.failure_count = len(failure_report)
             batch.parse_status = (

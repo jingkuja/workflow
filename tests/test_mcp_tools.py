@@ -49,6 +49,7 @@ def test_boss_and_employee_tool_whitelists_are_isolated(tmp_path: Path) -> None:
     assert "t0_probe_wecom_mention" not in employee_tools
     assert "import_topic_document" in boss_tools
     assert "import_structured_topics" in boss_tools
+    assert "change_task_assignee" in boss_tools
     assert "review_script_submission" in boss_tools
     assert "get_workflow_dashboard" in boss_tools
     assert "list_operational_issues" in boss_tools
@@ -58,6 +59,7 @@ def test_boss_and_employee_tool_whitelists_are_isolated(tmp_path: Path) -> None:
     assert "get_workflow_dashboard" not in employee_tools
     assert "import_topic_document" not in employee_tools
     assert "import_structured_topics" not in employee_tools
+    assert "change_task_assignee" not in employee_tools
 
     upload_input = tool_parameters(boss_server, "upload_file")["file_base64"]
     assert upload_input["contentEncoding"] == "base64"

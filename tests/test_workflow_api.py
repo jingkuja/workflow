@@ -77,6 +77,18 @@ def test_auth_matrix_and_unified_error_structure(api) -> None:
     assert forbidden.status_code == 403
     assert forbidden.json()["error"]["code"] == "FORBIDDEN"
 
+    employee_reassign = api.post(
+        "/internal/tools/change-task-assignee",
+        headers=EMP_A,
+        json={
+            "task_no": "TASK-20260730-0001",
+            "new_employee_id": "employee-b",
+            "idempotency_key": "employee-reassign-forbidden-0001",
+        },
+    )
+    assert employee_reassign.status_code == 403
+    assert employee_reassign.json()["error"]["code"] == "FORBIDDEN"
+
     boss_on_employee = api.post("/internal/tools/list-my-tasks", headers=BOSS, json={})
     assert boss_on_employee.status_code == 403
     assert boss_on_employee.json()["error"]["code"] == "FORBIDDEN"

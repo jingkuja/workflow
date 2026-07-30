@@ -13,7 +13,7 @@ from typing import Annotated, Any
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import func, select, text
 from sqlalchemy.orm import Session
 from sqlalchemy.orm.exc import StaleDataError
@@ -459,9 +459,11 @@ def download_file(
 
 
 class ImportTopicBody(BaseModel):
-    original_filename: str
-    idempotency_key: str
-    content_base64: str | None = None
+    model_config = ConfigDict(extra="forbid")
+
+    original_filename: str = Field(min_length=1, max_length=255)
+    idempotency_key: str = Field(min_length=1, max_length=255)
+    file_key: str | None = Field(default=None, min_length=1, max_length=64)
     file_url: str | None = None
 
 
@@ -523,12 +525,20 @@ class MyTasksBody(BaseModel):
 
 
 class SubmitScriptBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     task_no: str
-    original_filename: str
-    idempotency_key: str
-    content_base64: str | None = None
+    original_filename: str = Field(min_length=1, max_length=255)
+    idempotency_key: str = Field(min_length=1, max_length=255)
+    file_key: str | None = Field(default=None, min_length=1, max_length=64)
     file_url: str | None = None
     note: str | None = None
+
+
+class UploadFileBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    file_base64: str = Field(min_length=1)
 
 
 class PageBody(BaseModel):
@@ -548,6 +558,18 @@ class ReportBlockerBody(BaseModel):
     idempotency_key: str
 
 
+@app.post("/internal/tools/upload-file")
+def tool_upload_file(
+    body: UploadFileBody,
+    actor: Annotated[ActorProfile, Depends(current_actor)],
+) -> dict[str, object]:
+    return t2_service.upload_file(
+        actor_name=actor.display_name,
+        role=actor.role,
+        file_base64=body.file_base64,
+    )
+
+
 @app.post("/internal/tools/import-topic-document")
 def tool_import_topic_document(
     body: ImportTopicBody,
@@ -557,7 +579,7 @@ def tool_import_topic_document(
         actor_name=actor.display_name,
         original_filename=body.original_filename,
         idempotency_key=body.idempotency_key,
-        content_base64=body.content_base64,
+        file_key=body.file_key,
         file_url=body.file_url,
     )
 
@@ -574,7 +596,7 @@ def tool_import_structured_topics(
         topics=body.topics,
         warnings=body.warnings,
         schema_version=body.schema_version,
-        content_base64=body.content_base64,
+        file_key=body.file_key,
         file_url=body.file_url,
     )
 
@@ -743,7 +765,7 @@ def tool_submit_script_file(
         task_no=body.task_no,
         original_filename=body.original_filename,
         idempotency_key=body.idempotency_key,
-        content_base64=body.content_base64,
+        file_key=body.file_key,
         file_url=body.file_url,
         note=body.note,
     )

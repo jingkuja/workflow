@@ -52,7 +52,7 @@ class StructuredTopicImportBody(BaseModel):
     topics: list[StructuredTopicInput] = Field(min_length=1, max_length=100)
     warnings: list[str] = Field(default_factory=list, max_length=100)
     schema_version: str = Field(default="1.0", pattern=r"^1\.0$")
-    content_base64: str | None = None
+    file_key: str | None = Field(default=None, min_length=1, max_length=64)
     file_url: str | None = None
 
     @field_validator("warnings")

@@ -170,6 +170,36 @@ class Attachment(TimestampMixin, Base):
     )
 
 
+class McpFileUpload(Base):
+    """MCP Host 预上传的临时文件。
+
+    file_key 只是句柄，不是 bearer capability；消费时仍按 company_id 和
+    uploaded_by 校验当前调用人，避免跨人员复用。
+    """
+
+    __tablename__ = "mcp_file_uploads"
+    __table_args__ = (
+        Index("ix_mcp_upload_owner_expiry", "company_id", "uploaded_by", "expires_at"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    company_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    uploaded_by: Mapped[str] = mapped_column(
+        ForeignKey("actor_profiles.id"), nullable=False
+    )
+    file_key: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
+    storage_provider: Mapped[str] = mapped_column(
+        String(32), default="LOCAL", nullable=False
+    )
+    storage_key: Mapped[str] = mapped_column(String(1000), nullable=False)
+    sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    size_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, nullable=False
+    )
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
 class Submission(TimestampMixin, Base):
     __tablename__ = "submissions"
     __table_args__ = (UniqueConstraint("task_id", "version_no", name="uq_submission_task_version"),)

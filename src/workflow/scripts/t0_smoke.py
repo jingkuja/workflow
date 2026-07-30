@@ -8,7 +8,6 @@ import os
 import resource
 import sys
 import time
-import uuid
 from pathlib import Path
 from typing import Any
 
@@ -64,30 +63,22 @@ async def call_server(
             if document is not None:
                 encoded = base64.b64encode(document.read_bytes()).decode("ascii")
                 document_result = await session.call_tool(
-                    "t0_probe_document_input",
-                    arguments={
-                        "original_filename": document.name,
-                        "content_base64": encoded,
-                        "idempotency_key": f"doc-{uuid.uuid4().hex}",
-                    },
+                    "upload_file",
+                    arguments={"file_base64": encoded},
                 )
                 result["document_error"] = document_result.isError
-                result["document_result"] = document_result.structuredContent
+                result["document_upload"] = document_result.structuredContent
 
             if video is not None:
                 video_started = time.perf_counter()
                 encoded = base64.b64encode(video.read_bytes()).decode("ascii")
                 result["video_encoded_chars"] = len(encoded)
                 video_result = await session.call_tool(
-                    "t0_probe_video_base64",
-                    arguments={
-                        "original_filename": video.name,
-                        "video_base64": encoded,
-                        "idempotency_key": f"video-{uuid.uuid4().hex}",
-                    },
+                    "upload_file",
+                    arguments={"file_base64": encoded},
                 )
                 result["video_error"] = video_result.isError
-                result["video_result"] = video_result.structuredContent
+                result["video_upload"] = video_result.structuredContent
                 result["video_elapsed_seconds"] = round(
                     time.perf_counter() - video_started,
                     3,

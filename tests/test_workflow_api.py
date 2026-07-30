@@ -46,6 +46,16 @@ def api(tmp_path, monkeypatch):
     get_settings.cache_clear()
 
 
+def upload_file(api, headers: dict[str, str], content: bytes) -> str:
+    response = api.post(
+        "/internal/tools/upload-file",
+        headers=headers,
+        json={"file_base64": base64.b64encode(content).decode()},
+    )
+    assert response.status_code == 200
+    return response.json()["data"]["file_key"]
+
+
 def test_auth_matrix_and_unified_error_structure(api) -> None:
     ok = api.get("/internal/t1/identity", headers=BOSS)
     assert ok.status_code == 200
@@ -86,11 +96,11 @@ def test_structured_topic_import_api_accepts_non_template_word(api) -> None:
     document.add_paragraph("企业开始用智能代理处理重复性内容工作。")
     buffer = BytesIO()
     document.save(buffer)
-    encoded = base64.b64encode(buffer.getvalue()).decode()
+    file_key = upload_file(api, BOSS, buffer.getvalue())
     body = {
         "original_filename": "自由格式.docx",
         "idempotency_key": "api-structured-0001",
-        "content_base64": encoded,
+        "file_key": file_key,
         "topics": [
             {
                 "title": "智能代理进入内容工作流",
@@ -109,19 +119,30 @@ def test_structured_topic_import_api_accepts_non_template_word(api) -> None:
     assert imported.json()["data"]["import_mode"] == "WORKBUDDY_STRUCTURED"
     assert imported.json()["data"]["created_count"] == 1
 
+    legacy_body = {**body, "content_base64": base64.b64encode(buffer.getvalue()).decode()}
+    legacy_body.pop("file_key")
+    legacy = api.post(
+        "/internal/tools/import-structured-topics",
+        headers=BOSS,
+        json=legacy_body,
+    )
+    assert legacy.status_code == 400
+    assert legacy.json()["error"]["code"] == "INVALID_ARGUMENT"
+
     forbidden = api.post("/internal/tools/import-structured-topics", headers=EMP_A, json=body)
     assert forbidden.status_code == 403
 
 
 def test_full_topic_script_flow_through_internal_api(api) -> None:
     document = Path("docs/AI行业选题文档上传样例.docx").read_bytes()
+    topic_file_key = upload_file(api, BOSS, document)
     imported = api.post(
         "/internal/tools/import-topic-document",
         headers=BOSS,
         json={
             "original_filename": "选题.docx",
             "idempotency_key": "api-import-0001",
-            "content_base64": base64.b64encode(document).decode(),
+            "file_key": topic_file_key,
         },
     )
     assert imported.status_code == 200
@@ -143,6 +164,7 @@ def test_full_topic_script_flow_through_internal_api(api) -> None:
     mine = api.post("/internal/tools/list-my-tasks", headers=owner_headers, json={})
     assert any(item["task_no"] == task["task_no"] for item in mine.json()["data"])
 
+    script_file_key = upload_file(api, owner_headers, "第一版".encode())
     submitted = api.post(
         "/internal/tools/submit-script-file",
         headers=owner_headers,
@@ -150,7 +172,7 @@ def test_full_topic_script_flow_through_internal_api(api) -> None:
             "task_no": task["task_no"],
             "original_filename": "演播稿.txt",
             "idempotency_key": "api-submit-0001",
-            "content_base64": base64.b64encode("第一版".encode()).decode(),
+            "file_key": script_file_key,
             "note": "初稿",
         },
     )

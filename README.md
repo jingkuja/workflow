@@ -52,6 +52,15 @@ Nginx 使用 Docker DNS 动态解析 MCP/API 上游，应用容器重建后不�
 后的值追加到 `MCP_ALLOWED_HOSTS`。服务始终保留 MCP SDK 的 DNS 重绑定保护。
 
 WorkBuddy 应配置完整入口 `/mcp/boss` 或 `/mcp/employee`，不要使用 `/mcp`。
+本地文件统一使用两步工具链：
+
+1. 明确调用 `upload_file`。它的 `file_base64` 参数带有
+   `contentEncoding: base64`、`format: byte`，由 MCP Host 读取本地文件并填充，
+   不是模型生成的文本。
+2. 使用返回的 `file_key` 调用 `import_structured_topics`、
+   `import_topic_document` 或 `submit_script_file`。业务工具不再接收 Base64。
+
+`file_key` 绑定上传人和公司，默认 24 小时有效；过期后重新调用 `upload_file`。
 老板上传普通 `.docx` 时应优先调用 `import_structured_topics`：WorkBuddy 负责理解
 文档并生成结构化选题，后台直接保存任务与原文件，并负责去重、分配和审计。
 `import_topic_document` 仅保留给旧的固定标题模板。
@@ -131,7 +140,9 @@ scripts/generate_t0_video.sh t0-artifacts/t0-100mb.mp4
   --video t0-artifacts/t0-100mb.mp4
 ```
 
-大文件工具内部按块解码，避免同时保留第二份完整二进制内容；但 MCP SDK 和 JSON 解析层仍可能先把完整 Base64 字符串载入内存。必须使用真实 WorkBuddy 请求补做 T0 压测。
+Base64 只出现在独立的 `upload_file` 调用中，不再和选题、任务、备注等业务字段
+共享一个工具请求。MCP SDK 和 JSON 解析层仍可能先把完整 Base64 字符串载入
+内存，因此仍需使用真实 WorkBuddy 请求验证单次大文件上传的内存峰值。
 
 ## 企业微信验证
 

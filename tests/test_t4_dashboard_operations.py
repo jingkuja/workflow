@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-import base64
 from pathlib import Path
 
 from pydantic import SecretStr
 from sqlalchemy import func, select
+from test_t2_service_flow import upload_file
 
 from workflow.config import Settings
 from workflow.db.models import (
@@ -46,11 +46,14 @@ def make_service(tmp_path: Path) -> T2Service:
 
 def import_sample(service: T2Service) -> list[dict[str, object]]:
     document = Path("docs/AI行业选题文档上传样例.docx").read_bytes()
+    file_key = upload_file(
+        service, actor_name="老板测试", role="BOSS", content=document
+    )
     result = service.import_topics(
         actor_name="老板测试",
         original_filename="选题.docx",
         idempotency_key="t4-import-0001",
-        content_base64=base64.b64encode(document).decode(),
+        file_key=file_key,
         file_url=None,
     )
     return result["data"]["tasks"]
@@ -84,12 +87,19 @@ def test_t4_dashboard_pagination_timeline_and_terminal_state(tmp_path: Path) -> 
     with session_scope(service.sessions) as session:
         assert session.scalar(select(func.count()).select_from(Notification)) == 11
 
+    employee_name = str(task["assigned_employee_name"])
+    script_file_key = upload_file(
+        service,
+        actor_name=employee_name,
+        role="EMPLOYEE",
+        content="演播稿".encode(),
+    )
     service.submit_script(
-        actor_name=str(task["assigned_employee_name"]),
+        actor_name=employee_name,
         task_no=str(task["task_no"]),
         original_filename="演播稿.txt",
         idempotency_key="t4-submit-0001",
-        content_base64=base64.b64encode("演播稿".encode()).decode(),
+        file_key=script_file_key,
         file_url=None,
         note="T4",
     )

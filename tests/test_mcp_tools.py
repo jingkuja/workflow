@@ -27,11 +27,20 @@ def tool_names(server: Any) -> set[str]:
     return {tool.name for tool in tools}
 
 
+def tool_parameters(server: Any, name: str) -> dict[str, Any]:
+    tool = next(item for item in server._tool_manager.list_tools() if item.name == name)
+    return tool.parameters["properties"]
+
+
 def test_boss_and_employee_tool_whitelists_are_isolated(tmp_path: Path) -> None:
     settings = make_settings(tmp_path)
-    boss_tools = tool_names(create_mcp_server(settings, "BOSS"))
-    employee_tools = tool_names(create_mcp_server(settings, "EMPLOYEE"))
+    boss_server = create_mcp_server(settings, "BOSS")
+    employee_server = create_mcp_server(settings, "EMPLOYEE")
+    boss_tools = tool_names(boss_server)
+    employee_tools = tool_names(employee_server)
 
+    assert "upload_file" in boss_tools
+    assert "upload_file" in employee_tools
     assert "t0_boss_capability" in boss_tools
     assert "t0_employee_capability" not in boss_tools
     assert "t0_employee_capability" in employee_tools
@@ -49,3 +58,17 @@ def test_boss_and_employee_tool_whitelists_are_isolated(tmp_path: Path) -> None:
     assert "get_workflow_dashboard" not in employee_tools
     assert "import_topic_document" not in employee_tools
     assert "import_structured_topics" not in employee_tools
+
+    upload_input = tool_parameters(boss_server, "upload_file")["file_base64"]
+    assert upload_input["contentEncoding"] == "base64"
+    assert upload_input["contentMediaType"] == "application/octet-stream"
+    assert upload_input["format"] == "byte"
+
+    for server, tool_name in (
+        (boss_server, "import_topic_document"),
+        (boss_server, "import_structured_topics"),
+        (employee_server, "submit_script_file"),
+    ):
+        parameters = tool_parameters(server, tool_name)
+        assert "file_key" in parameters
+        assert all("base64" not in name for name in parameters)

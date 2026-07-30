@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Annotated, Any
 
 from mcp.server.fastmcp import Context, FastMCP
 from mcp.server.fastmcp.server import TransportSecuritySettings
+from pydantic import Field
 
 from workflow.apps.api_client import WorkflowApiClient
 from workflow.config import Role, Settings
@@ -40,6 +41,8 @@ def create_mcp_server(settings: Settings, role: Role) -> FastMCP:
         instructions=(
             "新媒体内容制作工作流服务。当前 T4 以演播稿审核通过后的 "
             "WAITING_FOR_FILMING 为正常终态，并提供 T2 看板与运维查询。"
+            "处理本地文件时必须先明确调用 upload_file，取得 file_key 后再调用"
+            "导入或提交工具；不得把 Base64 拼进业务工具参数。"
         ),
         stateless_http=True,
         json_response=True,
@@ -59,39 +62,36 @@ def create_mcp_server(settings: Settings, role: Role) -> FastMCP:
         return service.ping().model_dump()
 
     @mcp.tool(
-        name="t0_probe_document_input",
+        name="upload_file",
         description=(
-            "验证 WorkBuddy 传入的 .docx/.pdf/.md/.txt 文件字段。"
-            "content_base64 与 file_url 必须二选一。"
+            "预上传一个本地文件并返回临时 file_key。调用模型只负责明确选择本工具；"
+            "file_base64 由 MCP Host 读取用户选择的文件并填充，不得由模型生成。"
+            "返回的 file_key 绑定当前调用人，默认 24 小时内可用于后续导入或提交工具。"
         ),
     )
-    def t0_probe_document_input(
-        original_filename: str,
-        idempotency_key: str,
-        content_base64: str | None = None,
-        file_url: str | None = None,
+    def upload_file(
+        file_base64: Annotated[
+            str,
+            Field(
+                description=(
+                    "MCP Host 提供的文件内容。Host 必须从本地文件读取并编码；"
+                    "该值不是模型输出。"
+                ),
+                json_schema_extra={
+                    "contentEncoding": "base64",
+                    "contentMediaType": "application/octet-stream",
+                    "format": "byte",
+                },
+            ),
+        ],
+        context: Context,
     ) -> dict[str, Any]:
-        return service.probe_document(
-            original_filename=original_filename,
-            content_base64=content_base64,
-            file_url=file_url,
-            idempotency_key=idempotency_key,
-        ).model_dump()
-
-    @mcp.tool(
-        name="t0_probe_video_base64",
-        description=("验证最大约 100 MB 视频的纯 Base64 字段、分块解码、文件头校验和落盘。"),
-    )
-    def t0_probe_video_base64(
-        original_filename: str,
-        video_base64: str,
-        idempotency_key: str,
-    ) -> dict[str, Any]:
-        return service.probe_video(
-            original_filename=original_filename,
-            video_base64=video_base64,
-            idempotency_key=idempotency_key,
-        ).model_dump()
+        return api.call(
+            "/internal/tools/upload-file",
+            token=_caller(context).token,
+            tool="upload_file",
+            payload={"file_base64": file_base64},
+        )
 
     @mcp.tool(
         name="t0_get_probe_file",
@@ -104,13 +104,16 @@ def create_mcp_server(settings: Settings, role: Role) -> FastMCP:
 
         @mcp.tool(
             name="import_topic_document",
-            description="导入 .docx 选题并自动均衡分配。已弃用。",
+            description=(
+                "导入 .docx 选题并自动均衡分配。已弃用。"
+                "本地文件必须先调用 upload_file，再把返回的 file_key 传入本工具。"
+            ),
         )
         def import_topic_document(
             original_filename: str,
             idempotency_key: str,
             context: Context,
-            content_base64: str | None = None,
+            file_key: str | None = None,
             file_url: str | None = None,
         ) -> dict[str, Any]:
             return api.call(
@@ -120,7 +123,7 @@ def create_mcp_server(settings: Settings, role: Role) -> FastMCP:
                 payload={
                     "original_filename": original_filename,
                     "idempotency_key": idempotency_key,
-                    "content_base64": content_base64,
+                    "file_key": file_key,
                     "file_url": file_url,
                 },
             )
@@ -134,6 +137,7 @@ def create_mcp_server(settings: Settings, role: Role) -> FastMCP:
                 "服务信任 MCP 结果并直接入库，同时保存源文件、去重并自动均衡分配。"
                 "调用完成后必须以工具返回的 created_count、deduplicated 和 tasks 为准，"
                 "不得用调用前 topics 数量自行宣称导入成功。"
+                "本地 Word 必须先调用 upload_file，本工具只接收返回的 file_key。"
             ),
         )
         def import_structured_topics(
@@ -141,7 +145,7 @@ def create_mcp_server(settings: Settings, role: Role) -> FastMCP:
             topics: list[StructuredTopicInput],
             idempotency_key: str,
             context: Context,
-            content_base64: str | None = None,
+            file_key: str | None = None,
             file_url: str | None = None,
             warnings: list[str] | None = None,
             schema_version: str = "1.0",
@@ -156,7 +160,7 @@ def create_mcp_server(settings: Settings, role: Role) -> FastMCP:
                     "warnings": warnings or [],
                     "schema_version": schema_version,
                     "idempotency_key": idempotency_key,
-                    "content_base64": content_base64,
+                    "file_key": file_key,
                     "file_url": file_url,
                 },
             )
@@ -400,13 +404,19 @@ def create_mcp_server(settings: Settings, role: Role) -> FastMCP:
                 payload={"task_no": task_no},
             )
 
-        @mcp.tool(name="submit_script_file", description="提交本人演播稿文件进入老板审核。")
+        @mcp.tool(
+            name="submit_script_file",
+            description=(
+                "提交本人演播稿文件进入老板审核。"
+                "本地文件必须先调用 upload_file，本工具只接收返回的 file_key。"
+            ),
+        )
         def submit_script_file(
             task_no: str,
             original_filename: str,
             idempotency_key: str,
             context: Context,
-            content_base64: str | None = None,
+            file_key: str | None = None,
             file_url: str | None = None,
             note: str | None = None,
         ) -> dict[str, Any]:
@@ -418,7 +428,7 @@ def create_mcp_server(settings: Settings, role: Role) -> FastMCP:
                     "task_no": task_no,
                     "original_filename": original_filename,
                     "idempotency_key": idempotency_key,
-                    "content_base64": content_base64,
+                    "file_key": file_key,
                     "file_url": file_url,
                     "note": note,
                 },

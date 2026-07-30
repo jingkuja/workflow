@@ -59,6 +59,13 @@ async def async_main(args: argparse.Namespace) -> int:
     boss_url = f"{base}/mcp/boss"
     employee_url = f"{base}/mcp/employee"
     encoded_word = base64.b64encode(args.document.read_bytes()).decode()
+    topic_upload = await call_tool(
+        boss_url,
+        boss_token,
+        "upload_file",
+        {"file_base64": encoded_word},
+    )
+    topic_file_key = topic_upload["data"]["file_key"]
 
     concurrency_result: dict[str, Any] | None = None
     if args.concurrency_check:
@@ -72,6 +79,13 @@ async def async_main(args: argparse.Namespace) -> int:
                 target_zip.writestr(item, source_zip.read(item.filename))
             target_zip.writestr(f"t2-concurrency-{uuid.uuid4().hex}.txt", "probe")
         concurrent_encoded = base64.b64encode(output.getvalue()).decode()
+        concurrent_upload = await call_tool(
+            boss_url,
+            boss_token,
+            "upload_file",
+            {"file_base64": concurrent_encoded},
+        )
+        concurrent_file_key = concurrent_upload["data"]["file_key"]
 
         async def concurrent_import() -> dict[str, Any]:
             return await call_tool(
@@ -80,7 +94,7 @@ async def async_main(args: argparse.Namespace) -> int:
                 "import_topic_document",
                 {
                     "original_filename": args.document.name,
-                    "content_base64": concurrent_encoded,
+                    "file_key": concurrent_file_key,
                     "idempotency_key": f"t2-concurrent-{uuid.uuid4().hex}",
                 },
             )
@@ -97,7 +111,7 @@ async def async_main(args: argparse.Namespace) -> int:
         "import_topic_document",
         {
             "original_filename": args.document.name,
-            "content_base64": encoded_word,
+            "file_key": topic_file_key,
             "idempotency_key": f"t2-import-{uuid.uuid4().hex}",
         },
     )
@@ -109,7 +123,7 @@ async def async_main(args: argparse.Namespace) -> int:
         "import_topic_document",
         {
             "original_filename": args.document.name,
-            "content_base64": encoded_word,
+            "file_key": topic_file_key,
             "idempotency_key": f"t2-import-duplicate-{uuid.uuid4().hex}",
         },
     )
@@ -125,6 +139,13 @@ async def async_main(args: argparse.Namespace) -> int:
     )
     assert mine["data"]["task"]["task_no"] == task_no
     first_content = base64.b64encode("第一版演播稿".encode()).decode()
+    first_upload = await call_tool(
+        employee_url,
+        employee_token,
+        "upload_file",
+        {"file_base64": first_content},
+    )
+    first_file_key = first_upload["data"]["file_key"]
     first_key = f"t2-submit-{uuid.uuid4().hex}"
     first = await call_tool(
         employee_url,
@@ -133,7 +154,7 @@ async def async_main(args: argparse.Namespace) -> int:
         {
             "task_no": task_no,
             "original_filename": "演播稿-v1.txt",
-            "content_base64": first_content,
+            "file_key": first_file_key,
             "note": "T2 冒烟第一版",
             "idempotency_key": first_key,
         },
@@ -145,7 +166,7 @@ async def async_main(args: argparse.Namespace) -> int:
         {
             "task_no": task_no,
             "original_filename": "演播稿-v1.txt",
-            "content_base64": first_content,
+            "file_key": first_file_key,
             "note": "T2 冒烟第一版",
             "idempotency_key": first_key,
         },
@@ -167,6 +188,12 @@ async def async_main(args: argparse.Namespace) -> int:
     assert rejected["data"]["task_status"] == "REJECTED"
 
     second_content = base64.b64encode("第二版演播稿，已补充开场钩子。".encode()).decode()
+    second_upload = await call_tool(
+        employee_url,
+        employee_token,
+        "upload_file",
+        {"file_base64": second_content},
+    )
     second = await call_tool(
         employee_url,
         employee_token,
@@ -174,7 +201,7 @@ async def async_main(args: argparse.Namespace) -> int:
         {
             "task_no": task_no,
             "original_filename": "演播稿-v2.md",
-            "content_base64": second_content,
+            "file_key": second_upload["data"]["file_key"],
             "note": "按驳回意见修改",
             "idempotency_key": f"t2-submit-{uuid.uuid4().hex}",
         },

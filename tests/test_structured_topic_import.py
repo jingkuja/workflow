@@ -1,11 +1,10 @@
 from __future__ import annotations
 
-import base64
 from io import BytesIO
 
 from docx import Document
 from sqlalchemy import select
-from test_t2_service_flow import make_service
+from test_t2_service_flow import make_service, upload_file
 
 from workflow.db.models import ContentProject
 from workflow.t2.contracts import StructuredTopicInput
@@ -26,7 +25,9 @@ def _arbitrary_document() -> bytes:
 def test_structured_import_accepts_arbitrary_word_layout_and_deduplicates(tmp_path) -> None:
     service = make_service(tmp_path)
     content = _arbitrary_document()
-    encoded = base64.b64encode(content).decode()
+    file_key = upload_file(
+        service, actor_name="老板测试", role="BOSS", content=content
+    )
     topics = [
         StructuredTopicInput(
             source_index="段落 2",
@@ -52,7 +53,7 @@ def test_structured_import_accepts_arbitrary_word_layout_and_deduplicates(tmp_pa
         topics=topics,
         warnings=["第二条需要确认数据时效。"],
         schema_version="1.0",
-        content_base64=encoded,
+        file_key=file_key,
         file_url=None,
     )
 
@@ -78,7 +79,7 @@ def test_structured_import_accepts_arbitrary_word_layout_and_deduplicates(tmp_pa
         topics=topics,
         warnings=[],
         schema_version="1.0",
-        content_base64=encoded,
+        file_key=file_key,
         file_url=None,
     )
     assert duplicate["data"]["deduplicated"] is True
@@ -99,7 +100,7 @@ def test_structured_import_accepts_arbitrary_word_layout_and_deduplicates(tmp_pa
         ],
         warnings=[],
         schema_version="1.0",
-        content_base64=encoded,
+        file_key=file_key,
         file_url=None,
     )
     assert changed_extraction["data"]["deduplicated"] is False
@@ -108,7 +109,12 @@ def test_structured_import_accepts_arbitrary_word_layout_and_deduplicates(tmp_pa
 
 def test_structured_import_trusts_mcp_content_without_source_verification(tmp_path) -> None:
     service = make_service(tmp_path)
-    encoded = base64.b64encode(_arbitrary_document()).decode()
+    file_key = upload_file(
+        service,
+        actor_name="老板测试",
+        role="BOSS",
+        content=_arbitrary_document(),
+    )
 
     imported = service.import_structured_topics(
         actor_name="老板测试",
@@ -125,7 +131,7 @@ def test_structured_import_trusts_mcp_content_without_source_verification(tmp_pa
         ],
         warnings=[],
         schema_version="1.0",
-        content_base64=encoded,
+        file_key=file_key,
         file_url=None,
     )
 

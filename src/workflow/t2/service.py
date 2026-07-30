@@ -54,8 +54,9 @@ from workflow.t2.allocation import (
 )
 from workflow.t2.calendar import effective_started_at, week_start_for
 from workflow.t2.contracts import StructuredTopicInput
-from workflow.t2.files import DOCUMENT_MIME_TYPES, receive_document
+from workflow.t2.files import DOCUMENT_MIME_TYPES, download_document
 from workflow.t2.parser import TopicParseError, parse_topic_document
+from workflow.uploads import McpUploadService
 
 TOPIC_EXTENSIONS = {".docx"}
 SCRIPT_EXTENSIONS = {".docx", ".pdf", ".md", ".txt"}
@@ -76,6 +77,22 @@ class T2Service:
         self.engine = create_engine_from_settings(settings)
         self.sessions = make_session_factory(self.engine)
         self.storage = LocalStorage(settings.file_data_dir, settings.disk_reject_percent)
+        self.uploads = McpUploadService(settings)
+
+    def upload_file(
+        self,
+        *,
+        actor_name: str,
+        role: Role,
+        file_base64: str,
+    ) -> dict[str, object]:
+        with session_scope(self.sessions) as session:
+            actor = self._actor(session, actor_name, role)
+            return self.uploads.upload_base64(
+                session,
+                actor=actor,
+                file_base64=file_base64,
+            )
 
     def import_topics(
         self,
@@ -83,14 +100,16 @@ class T2Service:
         actor_name: str,
         original_filename: str,
         idempotency_key: str,
-        content_base64: str | None,
+        file_key: str | None,
         file_url: str | None,
     ) -> dict[str, Any]:
-        content = receive_document(
+        content = self._receive_document(
+            actor_name=actor_name,
+            role=Role.BOSS,
             filename=original_filename,
             allowed=TOPIC_EXTENSIONS,
             max_bytes=self.settings.max_topic_document_bytes,
-            content_base64=content_base64,
+            file_key=file_key,
             file_url=file_url,
         )
         sha256 = hashlib.sha256(content).hexdigest()
@@ -140,14 +159,16 @@ class T2Service:
         topics: list[StructuredTopicInput],
         warnings: list[str],
         schema_version: str,
-        content_base64: str | None,
+        file_key: str | None,
         file_url: str | None,
     ) -> dict[str, Any]:
-        content = receive_document(
+        content = self._receive_document(
+            actor_name=actor_name,
+            role=Role.BOSS,
             filename=original_filename,
             allowed=TOPIC_EXTENSIONS,
             max_bytes=self.settings.max_topic_document_bytes,
-            content_base64=content_base64,
+            file_key=file_key,
             file_url=file_url,
         )
         source_sha256 = hashlib.sha256(content).hexdigest()
@@ -1079,15 +1100,17 @@ class T2Service:
         task_no: str,
         original_filename: str,
         idempotency_key: str,
-        content_base64: str | None,
+        file_key: str | None,
         file_url: str | None,
         note: str | None,
     ) -> dict[str, Any]:
-        content = receive_document(
+        content = self._receive_document(
+            actor_name=actor_name,
+            role=Role.EMPLOYEE,
             filename=original_filename,
             allowed=SCRIPT_EXTENSIONS,
             max_bytes=self.settings.max_script_document_bytes,
-            content_base64=content_base64,
+            file_key=file_key,
             file_url=file_url,
         )
         sha256 = hashlib.sha256(content).hexdigest()
@@ -1633,6 +1656,37 @@ class T2Service:
         session.add(attachment)
         session.flush()
         return attachment
+
+    def _receive_document(
+        self,
+        *,
+        actor_name: str,
+        role: Role,
+        filename: str,
+        allowed: set[str],
+        max_bytes: int,
+        file_key: str | None,
+        file_url: str | None,
+    ) -> bytes:
+        if (file_key is None) == (file_url is None):
+            raise InvalidArgument("file_key 与 file_url 必须二选一。")
+        if file_url is not None:
+            return download_document(
+                file_url,
+                filename=filename,
+                allowed=allowed,
+                max_bytes=max_bytes,
+            )
+        with session_scope(self.sessions) as session:
+            actor = self._actor(session, actor_name, role)
+            return self.uploads.read_document(
+                session,
+                actor=actor,
+                file_key=file_key or "",
+                filename=filename,
+                allowed=allowed,
+                max_bytes=max_bytes,
+            )
 
     def _import_response(
         self,

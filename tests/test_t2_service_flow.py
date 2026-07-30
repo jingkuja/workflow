@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 import base64
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
 from pydantic import SecretStr
+from sqlalchemy import select
 
-from workflow.config import Settings
-from workflow.db.models import Base
+from workflow.config import Role, Settings
+from workflow.db.models import Base, McpFileUpload
 from workflow.db.session import make_session_factory, session_scope
 from workflow.errors import ResourceNotFound
 from workflow.identity import sync_actor_profiles
@@ -40,16 +42,70 @@ def make_service(tmp_path: Path, employees_json: str = _TWO_EMPLOYEES) -> T2Serv
     return service
 
 
+def upload_file(
+    service: T2Service,
+    *,
+    actor_name: str,
+    role: Role,
+    content: bytes,
+) -> str:
+    response = service.upload_file(
+        actor_name=actor_name,
+        role=role,
+        file_base64=base64.b64encode(content).decode(),
+    )
+    return str(response["data"]["file_key"])
+
+
+def test_uploaded_file_key_is_bound_to_actor_and_expiry(tmp_path: Path) -> None:
+    service = make_service(tmp_path)
+    file_key = upload_file(
+        service,
+        actor_name="员工甲",
+        role="EMPLOYEE",
+        content="演播稿".encode(),
+    )
+
+    with pytest.raises(ResourceNotFound, match="不属于当前调用人"):
+        service._receive_document(
+            actor_name="员工乙",
+            role="EMPLOYEE",
+            filename="演播稿.txt",
+            allowed={".txt"},
+            max_bytes=1024,
+            file_key=file_key,
+            file_url=None,
+        )
+
+    with session_scope(service.sessions) as session:
+        upload = session.scalar(select(McpFileUpload).where(McpFileUpload.file_key == file_key))
+        assert upload is not None
+        upload.expires_at = datetime.now(UTC) - timedelta(seconds=1)
+
+    with pytest.raises(ResourceNotFound, match="已过期"):
+        service._receive_document(
+            actor_name="员工甲",
+            role="EMPLOYEE",
+            filename="演播稿.txt",
+            allowed={".txt"},
+            max_bytes=1024,
+            file_key=file_key,
+            file_url=None,
+        )
+
+
 def test_t2_full_topic_script_workflow(tmp_path: Path) -> None:
     service = make_service(tmp_path)
     document = Path("docs/AI行业选题文档上传样例.docx").read_bytes()
-    encoded = base64.b64encode(document).decode()
+    topic_file_key = upload_file(
+        service, actor_name="老板测试", role="BOSS", content=document
+    )
 
     imported = service.import_topics(
         actor_name="老板测试",
         original_filename="选题.docx",
         idempotency_key="import-key-0001",
-        content_base64=encoded,
+        file_key=topic_file_key,
         file_url=None,
     )
     tasks = imported["data"]["tasks"]
@@ -64,7 +120,7 @@ def test_t2_full_topic_script_workflow(tmp_path: Path) -> None:
         actor_name="老板测试",
         original_filename="选题.docx",
         idempotency_key="import-key-0002",
-        content_base64=encoded,
+        file_key=topic_file_key,
         file_url=None,
     )
     assert duplicate["data"]["deduplicated"] is True
@@ -76,12 +132,18 @@ def test_t2_full_topic_script_workflow(tmp_path: Path) -> None:
     with pytest.raises(ResourceNotFound):
         service.get_my_task(actor_name=other, task_no=target["task_no"])
 
+    first_script_key = upload_file(
+        service,
+        actor_name=owner,
+        role="EMPLOYEE",
+        content="第一版".encode(),
+    )
     submitted = service.submit_script(
         actor_name=owner,
         task_no=target["task_no"],
         original_filename="演播稿.txt",
         idempotency_key="submit-key-0001",
-        content_base64=base64.b64encode("第一版".encode()).decode(),
+        file_key=first_script_key,
         file_url=None,
         note="初稿",
     )
@@ -90,7 +152,7 @@ def test_t2_full_topic_script_workflow(tmp_path: Path) -> None:
         task_no=target["task_no"],
         original_filename="演播稿.txt",
         idempotency_key="submit-key-0001",
-        content_base64=base64.b64encode("第一版".encode()).decode(),
+        file_key=first_script_key,
         file_url=None,
         note="初稿",
     )
@@ -104,12 +166,18 @@ def test_t2_full_topic_script_workflow(tmp_path: Path) -> None:
         idempotency_key="review-key-0001",
     )
     assert rejected["data"]["task_status"] == "REJECTED"
+    second_script_key = upload_file(
+        service,
+        actor_name=owner,
+        role="EMPLOYEE",
+        content="第二版".encode(),
+    )
     second = service.submit_script(
         actor_name=owner,
         task_no=target["task_no"],
         original_filename="演播稿-v2.md",
         idempotency_key="submit-key-0002",
-        content_base64=base64.b64encode("第二版".encode()).decode(),
+        file_key=second_script_key,
         file_url=None,
         note="修改稿",
     )
@@ -164,12 +232,15 @@ def test_t2_full_topic_script_workflow(tmp_path: Path) -> None:
 def test_import_without_employees_creates_pending_assignment_tasks(tmp_path: Path) -> None:
     service = make_service(tmp_path, employees_json="[]")
     document = Path("docs/AI行业选题文档上传样例.docx").read_bytes()
+    topic_file_key = upload_file(
+        service, actor_name="老板测试", role="BOSS", content=document
+    )
 
     imported = service.import_topics(
         actor_name="老板测试",
         original_filename="选题.docx",
         idempotency_key="import-key-no-employee",
-        content_base64=base64.b64encode(document).decode(),
+        file_key=topic_file_key,
         file_url=None,
     )
 

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import base64
 import json
 import os
 import uuid
@@ -51,19 +50,35 @@ async def call_tool(url: str, token: str, tool: str, arguments: dict[str, Any]) 
             return payload
 
 
+async def upload_file(base_url: str, token: str, content: bytes) -> dict[str, Any]:
+    async with httpx.AsyncClient(timeout=300, trust_env=False) as client:
+        response = await client.post(
+            f"{base_url}/api/files/upload",
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/octet-stream",
+            },
+            content=content,
+        )
+    response.raise_for_status()
+    payload = response.json()
+    if payload.get("success") is False or not payload.get("data", {}).get("file_key"):
+        raise RuntimeError(f"文件上传失败: {payload}")
+    return payload
+
+
 async def async_main(args: argparse.Namespace) -> int:
     boss_token = os.environ["MCP_BOSS_TOKEN"]
+    upload_token = os.environ["FILE_UPLOAD_TOKEN"]
     employees = json.loads(os.environ["MCP_EMPLOYEES_JSON"])
     employee_token = employees[0]["token"]
     base = args.base_url.rstrip("/")
     boss_url = f"{base}/mcp/boss"
     employee_url = f"{base}/mcp/employee"
-    encoded_word = base64.b64encode(args.document.read_bytes()).decode()
-    topic_upload = await call_tool(
-        boss_url,
-        boss_token,
-        "upload_file",
-        {"file_base64": encoded_word},
+    topic_upload = await upload_file(
+        base,
+        upload_token,
+        args.document.read_bytes(),
     )
     topic_file_key = topic_upload["data"]["file_key"]
 
@@ -78,12 +93,10 @@ async def async_main(args: argparse.Namespace) -> int:
             for item in source_zip.infolist():
                 target_zip.writestr(item, source_zip.read(item.filename))
             target_zip.writestr(f"t2-concurrency-{uuid.uuid4().hex}.txt", "probe")
-        concurrent_encoded = base64.b64encode(output.getvalue()).decode()
-        concurrent_upload = await call_tool(
-            boss_url,
-            boss_token,
-            "upload_file",
-            {"file_base64": concurrent_encoded},
+        concurrent_upload = await upload_file(
+            base,
+            upload_token,
+            output.getvalue(),
         )
         concurrent_file_key = concurrent_upload["data"]["file_key"]
 
@@ -138,12 +151,10 @@ async def async_main(args: argparse.Namespace) -> int:
         {"task_no": task_no},
     )
     assert mine["data"]["task"]["task_no"] == task_no
-    first_content = base64.b64encode("第一版演播稿".encode()).decode()
-    first_upload = await call_tool(
-        employee_url,
-        employee_token,
-        "upload_file",
-        {"file_base64": first_content},
+    first_upload = await upload_file(
+        base,
+        upload_token,
+        "第一版演播稿".encode(),
     )
     first_file_key = first_upload["data"]["file_key"]
     first_key = f"t2-submit-{uuid.uuid4().hex}"
@@ -187,12 +198,10 @@ async def async_main(args: argparse.Namespace) -> int:
     )
     assert rejected["data"]["task_status"] == "REJECTED"
 
-    second_content = base64.b64encode("第二版演播稿，已补充开场钩子。".encode()).decode()
-    second_upload = await call_tool(
-        employee_url,
-        employee_token,
-        "upload_file",
-        {"file_base64": second_content},
+    second_upload = await upload_file(
+        base,
+        upload_token,
+        "第二版演播稿，已补充开场钩子。".encode(),
     )
     second = await call_tool(
         employee_url,

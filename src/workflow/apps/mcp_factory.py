@@ -1,11 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Annotated, Any
+from typing import Any
 
 from mcp.server.fastmcp import Context, FastMCP
 from mcp.server.fastmcp.server import TransportSecuritySettings
-from pydantic import Field
 
 from workflow.apps.api_client import WorkflowApiClient
 from workflow.config import Role, Settings
@@ -41,8 +40,8 @@ def create_mcp_server(settings: Settings, role: Role) -> FastMCP:
         instructions=(
             "新媒体内容制作工作流服务。当前 T4 以演播稿审核通过后的 "
             "WAITING_FOR_FILMING 为正常终态，并提供 T2 看板与运维查询。"
-            "处理本地文件时必须先明确调用 upload_file，取得 file_key 后再调用"
-            "导入或提交工具；不得把 Base64 拼进业务工具参数。"
+            "MCP 不接收文件内容。处理本地文件时，先通过后台文件上传 API 取得 "
+            "file_key，再调用导入或提交工具；不得把文件内容或 Base64 拼进 MCP 参数。"
         ),
         stateless_http=True,
         json_response=True,
@@ -62,38 +61,6 @@ def create_mcp_server(settings: Settings, role: Role) -> FastMCP:
         return service.ping().model_dump()
 
     @mcp.tool(
-        name="upload_file",
-        description=(
-            "预上传一个本地文件并返回临时 file_key。调用模型只负责明确选择本工具；"
-            "file_base64 由 MCP Host 读取用户选择的文件并填充，不得由模型生成。"
-            "返回的 file_key 绑定当前调用人，默认 24 小时内可用于后续导入或提交工具。"
-        ),
-    )
-    def upload_file(
-        file_base64: Annotated[
-            str,
-            Field(
-                description=(
-                    "MCP Host 提供的文件内容。Host 必须从本地文件读取并编码；"
-                    "该值不是模型输出。"
-                ),
-                json_schema_extra={
-                    "contentEncoding": "base64",
-                    "contentMediaType": "application/octet-stream",
-                    "format": "byte",
-                },
-            ),
-        ],
-        context: Context,
-    ) -> dict[str, Any]:
-        return api.call(
-            "/internal/tools/upload-file",
-            token=_caller(context).token,
-            tool="upload_file",
-            payload={"file_base64": file_base64},
-        )
-
-    @mcp.tool(
         name="t0_get_probe_file",
         description="查询 T0 探针文件元数据和稳定下载地址。",
     )
@@ -106,7 +73,7 @@ def create_mcp_server(settings: Settings, role: Role) -> FastMCP:
             name="import_topic_document",
             description=(
                 "导入 .docx 选题并自动均衡分配。已弃用。"
-                "本地文件必须先调用 upload_file，再把返回的 file_key 传入本工具。"
+                "本地文件必须先通过后台文件上传 API 取得 file_key，再传入本工具。"
             ),
         )
         def import_topic_document(
@@ -137,7 +104,8 @@ def create_mcp_server(settings: Settings, role: Role) -> FastMCP:
                 "服务信任 MCP 结果并直接入库，同时保存源文件、去重并自动均衡分配。"
                 "调用完成后必须以工具返回的 created_count、deduplicated 和 tasks 为准，"
                 "不得用调用前 topics 数量自行宣称导入成功。"
-                "本地 Word 必须先调用 upload_file，本工具只接收返回的 file_key。"
+                "本地 Word 必须先通过后台文件上传 API 取得 file_key；"
+                "本工具不接收文件内容。"
             ),
         )
         def import_structured_topics(
@@ -408,7 +376,8 @@ def create_mcp_server(settings: Settings, role: Role) -> FastMCP:
             name="submit_script_file",
             description=(
                 "提交本人演播稿文件进入老板审核。"
-                "本地文件必须先调用 upload_file，本工具只接收返回的 file_key。"
+                "本地文件必须先通过后台文件上传 API 取得 file_key；"
+                "本工具不接收文件内容。"
             ),
         )
         def submit_script_file(

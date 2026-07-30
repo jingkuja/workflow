@@ -37,6 +37,9 @@ workflow-t4-smoke = "workflow.scripts.t4_smoke:main"
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools.package-data]
+workflow = ["static/*.html"]
+
 [tool.pytest.ini_options]
 addopts = "-q"
 pythonpath = ["src"]

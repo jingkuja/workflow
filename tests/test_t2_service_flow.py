@@ -1,16 +1,16 @@
 from __future__ import annotations
 
-import base64
 from collections import Counter
 from datetime import UTC, datetime, timedelta
+from io import BytesIO
 from pathlib import Path
 
 import pytest
 from pydantic import SecretStr
 from sqlalchemy import select
 
-from workflow.config import Role, Settings
-from workflow.db.models import Base, McpFileUpload, Notification
+from workflow.config import Settings
+from workflow.db.models import Base, Notification, TemporaryFileUpload
 from workflow.db.session import make_session_factory, session_scope
 from workflow.errors import ResourceNotFound
 from workflow.identity import sync_actor_profiles
@@ -46,15 +46,13 @@ def make_service(tmp_path: Path, employees_json: str = _TWO_EMPLOYEES) -> T2Serv
 def upload_file(
     service: T2Service,
     *,
-    actor_name: str,
-    role: Role,
     content: bytes,
 ) -> str:
-    response = service.upload_file(
-        actor_name=actor_name,
-        role=role,
-        file_base64=base64.b64encode(content).decode(),
-    )
+    with session_scope(service.sessions) as session:
+        response = service.uploads.upload_stream(
+            session,
+            stream=BytesIO(content),
+        )
     return str(response["data"]["file_key"])
 
 
@@ -62,12 +60,36 @@ def test_uploaded_file_key_is_bound_to_actor_and_expiry(tmp_path: Path) -> None:
     service = make_service(tmp_path)
     file_key = upload_file(
         service,
-        actor_name="员工甲",
-        role="EMPLOYEE",
         content="演播稿".encode(),
     )
 
-    with pytest.raises(ResourceNotFound, match="不属于当前调用人"):
+    with session_scope(service.sessions) as session:
+        upload = session.scalar(
+            select(TemporaryFileUpload).where(TemporaryFileUpload.file_key == file_key)
+        )
+        assert upload is not None
+        assert upload.company_id is None
+        assert upload.uploaded_by is None
+
+    assert service._receive_document(
+        actor_name="员工甲",
+        role="EMPLOYEE",
+        filename="演播稿.txt",
+        allowed={".txt"},
+        max_bytes=1024,
+        file_key=file_key,
+        file_url=None,
+    ) == "演播稿".encode()
+
+    with session_scope(service.sessions) as session:
+        upload = session.scalar(
+            select(TemporaryFileUpload).where(TemporaryFileUpload.file_key == file_key)
+        )
+        assert upload is not None
+        assert upload.company_id == "company-t2"
+        assert upload.uploaded_by is not None
+
+    with pytest.raises(ResourceNotFound, match="其他调用人"):
         service._receive_document(
             actor_name="员工乙",
             role="EMPLOYEE",
@@ -79,7 +101,9 @@ def test_uploaded_file_key_is_bound_to_actor_and_expiry(tmp_path: Path) -> None:
         )
 
     with session_scope(service.sessions) as session:
-        upload = session.scalar(select(McpFileUpload).where(McpFileUpload.file_key == file_key))
+        upload = session.scalar(
+            select(TemporaryFileUpload).where(TemporaryFileUpload.file_key == file_key)
+        )
         assert upload is not None
         upload.expires_at = datetime.now(UTC) - timedelta(seconds=1)
 
@@ -109,9 +133,7 @@ def test_t2_full_topic_script_workflow(tmp_path: Path, monkeypatch: pytest.Monke
 
     monkeypatch.setattr(service_module, "employee_loads", counted_employee_loads)
     document = Path("docs/AI行业选题文档上传样例.docx").read_bytes()
-    topic_file_key = upload_file(
-        service, actor_name="老板测试", role="BOSS", content=document
-    )
+    topic_file_key = upload_file(service, content=document)
 
     imported = service.import_topics(
         actor_name="老板测试",
@@ -153,8 +175,6 @@ def test_t2_full_topic_script_workflow(tmp_path: Path, monkeypatch: pytest.Monke
 
     first_script_key = upload_file(
         service,
-        actor_name=owner,
-        role="EMPLOYEE",
         content="第一版".encode(),
     )
     with monkeypatch.context() as submit_patch:
@@ -200,8 +220,6 @@ def test_t2_full_topic_script_workflow(tmp_path: Path, monkeypatch: pytest.Monke
         assert "修改后重新提交" in str(notification.payload["content"])
     second_script_key = upload_file(
         service,
-        actor_name=owner,
-        role="EMPLOYEE",
         content="第二版".encode(),
     )
     second = service.submit_script(
@@ -261,35 +279,15 @@ def test_t2_full_topic_script_workflow(tmp_path: Path, monkeypatch: pytest.Monke
     assert cancelled_task["status"] == "CANCELLED"
 
 
-def test_upload_base64_streams_decoded_chunks_to_storage(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    import workflow.uploads as uploads_module
-
+def test_upload_stream_writes_large_file_without_base64(tmp_path: Path) -> None:
     service = make_service(tmp_path)
     content = b"x" * (1024 * 1024)
-    decode_calls = 0
-    original_decode = uploads_module.base64.b64decode
-
-    def counted_decode(*args, **kwargs):
-        nonlocal decode_calls
-        decode_calls += 1
-        return original_decode(*args, **kwargs)
-
-    def fail_buffered_put(*args, **kwargs):
-        raise AssertionError("upload_file 不应先构造完整 bytes 再调用 put")
-
-    monkeypatch.setattr(uploads_module.base64, "b64decode", counted_decode)
-    monkeypatch.setattr(service.uploads.storage, "put", fail_buffered_put)
 
     file_key = upload_file(
         service,
-        actor_name="员工甲",
-        role="EMPLOYEE",
         content=content,
     )
 
-    assert decode_calls >= 2
     assert (
         service._receive_document(
             actor_name="员工甲",
@@ -307,9 +305,7 @@ def test_upload_base64_streams_decoded_chunks_to_storage(
 def test_import_without_employees_creates_pending_assignment_tasks(tmp_path: Path) -> None:
     service = make_service(tmp_path, employees_json="[]")
     document = Path("docs/AI行业选题文档上传样例.docx").read_bytes()
-    topic_file_key = upload_file(
-        service, actor_name="老板测试", role="BOSS", content=document
-    )
+    topic_file_key = upload_file(service, content=document)
 
     imported = service.import_topics(
         actor_name="老板测试",

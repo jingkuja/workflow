@@ -1,0 +1,110 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>上传文件并获取 file_key</title>
+  <style>
+    :root { color-scheme: light; font-family: system-ui, "Microsoft YaHei", sans-serif; }
+    body { margin: 0; background: #f5f7fb; color: #172033; }
+    main { max-width: 680px; margin: 48px auto; padding: 0 20px; }
+    section { background: white; border: 1px solid #dbe2ee; border-radius: 16px;
+      padding: 28px; box-shadow: 0 12px 36px rgba(31, 45, 72, .08); }
+    h1 { margin: 0 0 8px; font-size: 24px; }
+    p { color: #5d687b; line-height: 1.6; }
+    label { display: block; margin-top: 18px; font-weight: 650; }
+    input, button { box-sizing: border-box; width: 100%; margin-top: 8px; padding: 12px;
+      border: 1px solid #c7d0df; border-radius: 9px; font: inherit; }
+    button { border: 0; background: #225bd6; color: white; font-weight: 700; cursor: pointer; }
+    button:disabled { opacity: .55; cursor: wait; }
+    pre { min-height: 80px; margin-top: 20px; padding: 14px; overflow: auto;
+      border-radius: 9px; background: #101827; color: #dce8ff; white-space: pre-wrap; }
+    .row { display: grid; grid-template-columns: 1fr auto; gap: 10px; }
+    .row button { width: auto; min-width: 110px; }
+    small { display: block; margin-top: 8px; color: #68758a; }
+  </style>
+</head>
+<body>
+<main>
+  <section>
+    <h1>上传文件</h1>
+    <p>浏览器直接上传文件并返回 <code>file_key</code>，不需要安装 Node.js 或 Python。
+      上传阶段不绑定人员；首次调用业务 MCP 使用此 key 时才绑定调用人和公司。</p>
+    <form id="form">
+      <label for="endpoint">上传接口</label>
+      <input id="endpoint" type="url" required placeholder="https://workflow.example.com/api/files/upload">
+      <label for="token">固定上传 Token</label>
+      <input id="token" type="password" required autocomplete="off" placeholder="FILE_UPLOAD_TOKEN">
+      <small>Token 仅用于本次请求，不会保存在浏览器中。</small>
+      <label for="file">选择文件</label>
+      <input id="file" type="file" required>
+      <button id="submit" type="submit">上传并获取 file_key</button>
+    </form>
+    <pre id="result" aria-live="polite">等待选择文件…</pre>
+    <div class="row">
+      <input id="fileKey" readonly placeholder="上传成功后显示 file_key">
+      <button id="copy" type="button" disabled>复制 key</button>
+    </div>
+  </section>
+</main>
+<script>
+  const form = document.querySelector("#form");
+  const endpoint = document.querySelector("#endpoint");
+  const token = document.querySelector("#token");
+  const fileInput = document.querySelector("#file");
+  const submit = document.querySelector("#submit");
+  const result = document.querySelector("#result");
+  const fileKey = document.querySelector("#fileKey");
+  const copy = document.querySelector("#copy");
+
+  if (location.protocol === "http:" || location.protocol === "https:") {
+    endpoint.value = new URL("/api/files/upload", location.href).href;
+  }
+
+  form.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const file = fileInput.files[0];
+    if (!file) return;
+    submit.disabled = true;
+    copy.disabled = true;
+    fileKey.value = "";
+    result.textContent = `正在上传 ${file.name}（${file.size} 字节）…`;
+    try {
+      const response = await fetch(endpoint.value, {
+        method: "POST",
+        headers: {
+          "Authorization": `Bearer ${token.value}`,
+          "Content-Type": "application/octet-stream"
+        },
+        body: file
+      });
+      const payload = await response.json();
+      if (!response.ok || payload.success === false) {
+        throw new Error(payload?.error?.message || `HTTP ${response.status}`);
+      }
+      const data = payload.data || payload;
+      if (!data.file_key) throw new Error("响应中没有 file_key");
+      fileKey.value = data.file_key;
+      copy.disabled = false;
+      result.textContent = JSON.stringify({
+        file_key: data.file_key,
+        original_filename: file.name,
+        size_bytes: data.size_bytes ?? file.size,
+        sha256: data.sha256,
+        expires_at: data.expires_at
+      }, null, 2);
+    } catch (error) {
+      result.textContent = `上传失败：${error.message}`;
+    } finally {
+      submit.disabled = false;
+    }
+  });
+
+  copy.addEventListener("click", async () => {
+    await navigator.clipboard.writeText(fileKey.value);
+    copy.textContent = "已复制";
+    setTimeout(() => { copy.textContent = "复制 key"; }, 1200);
+  });
+</script>
+</body>
+</html>

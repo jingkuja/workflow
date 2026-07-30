@@ -6,7 +6,6 @@
 
 from __future__ import annotations
 
-import base64
 from io import BytesIO
 from pathlib import Path
 
@@ -17,6 +16,7 @@ from fastapi.testclient import TestClient
 BOSS = {"Authorization": "Bearer boss-token-at-least-16"}
 EMP_A = {"Authorization": "Bearer employee-a-token-12345"}
 EMP_B = {"Authorization": "Bearer employee-b-token-12345"}
+UPLOAD = {"Authorization": "Bearer fixed-upload-token-at-least-16"}
 
 
 @pytest.fixture
@@ -29,6 +29,7 @@ def api(tmp_path, monkeypatch):
     monkeypatch.setenv("COMPANY_ID", "company-api")
     monkeypatch.setenv("MCP_BOSS_NAME", "老板测试")
     monkeypatch.setenv("MCP_BOSS_TOKEN", "boss-token-at-least-16")
+    monkeypatch.setenv("FILE_UPLOAD_TOKEN", "fixed-upload-token-at-least-16")
     monkeypatch.setenv(
         "MCP_EMPLOYEES_JSON",
         '[{"name":"员工甲","token":"employee-a-token-12345","wecom_userid":"","active":true},'
@@ -46,11 +47,11 @@ def api(tmp_path, monkeypatch):
     get_settings.cache_clear()
 
 
-def upload_file(api, headers: dict[str, str], content: bytes) -> str:
+def upload_file(api, content: bytes) -> str:
     response = api.post(
-        "/internal/tools/upload-file",
-        headers=headers,
-        json={"file_base64": base64.b64encode(content).decode()},
+        "/api/files/upload",
+        headers={**UPLOAD, "Content-Type": "application/octet-stream"},
+        content=content,
     )
     assert response.status_code == 200
     return response.json()["data"]["file_key"]
@@ -102,13 +103,79 @@ def test_auth_matrix_and_unified_error_structure(api) -> None:
     assert not_found.json()["error"]["code"] == "RESOURCE_NOT_FOUND"
 
 
+def test_standalone_file_upload_api_contract(api) -> None:
+    content = b"standalone-upload"
+    uploaded = api.post(
+        "/api/files/upload",
+        headers={**UPLOAD, "Content-Type": "application/octet-stream"},
+        content=content,
+    )
+    assert uploaded.status_code == 200
+    assert uploaded.json()["data"]["file_key"]
+    assert uploaded.json()["data"]["size_bytes"] == len(content)
+
+    missing_auth = api.post(
+        "/api/files/upload",
+        headers={"Content-Type": "application/octet-stream"},
+        content=content,
+    )
+    assert missing_auth.status_code == 401
+
+    wrong_media_type = api.post(
+        "/api/files/upload",
+        headers={**UPLOAD, "Content-Type": "application/json"},
+        content=content,
+    )
+    assert wrong_media_type.status_code == 400
+    assert wrong_media_type.json()["error"]["code"] == "INVALID_ARGUMENT"
+
+    empty = api.post(
+        "/api/files/upload",
+        headers={**UPLOAD, "Content-Type": "application/octet-stream"},
+        content=b"",
+    )
+    assert empty.status_code == 400
+
+    removed_mcp_upload_route = api.post(
+        "/internal/tools/upload-file",
+        headers=BOSS,
+        json={"file_base64": "ZmlsZQ=="},
+    )
+    assert removed_mcp_upload_route.status_code == 404
+
+    personal_token = api.post(
+        "/api/files/upload",
+        headers={**BOSS, "Content-Type": "application/octet-stream"},
+        content=content,
+    )
+    assert personal_token.status_code == 401
+
+    page = api.get("/file-upload")
+    assert page.status_code == 200
+    assert "不需要安装 Node.js 或 Python" in page.text
+    assert page.text == Path(
+        "skill/upload-file-for-mcp/scripts/upload-file.html"
+    ).read_text()
+
+    preflight = api.options(
+        "/api/files/upload",
+        headers={
+            "Origin": "null",
+            "Access-Control-Request-Method": "POST",
+            "Access-Control-Request-Headers": "authorization,content-type",
+        },
+    )
+    assert preflight.status_code == 200
+    assert preflight.headers["access-control-allow-origin"] == "null"
+
+
 def test_structured_topic_import_api_accepts_non_template_word(api) -> None:
     document = Document()
     document.add_paragraph("这是一份没有固定标题样式的 ChatGPT 文档。")
     document.add_paragraph("企业开始用智能代理处理重复性内容工作。")
     buffer = BytesIO()
     document.save(buffer)
-    file_key = upload_file(api, BOSS, buffer.getvalue())
+    file_key = upload_file(api, buffer.getvalue())
     body = {
         "original_filename": "自由格式.docx",
         "idempotency_key": "api-structured-0001",
@@ -131,7 +198,7 @@ def test_structured_topic_import_api_accepts_non_template_word(api) -> None:
     assert imported.json()["data"]["import_mode"] == "WORKBUDDY_STRUCTURED"
     assert imported.json()["data"]["created_count"] == 1
 
-    legacy_body = {**body, "content_base64": base64.b64encode(buffer.getvalue()).decode()}
+    legacy_body = {**body, "content_base64": "ZmlsZQ=="}
     legacy_body.pop("file_key")
     legacy = api.post(
         "/internal/tools/import-structured-topics",
@@ -147,7 +214,7 @@ def test_structured_topic_import_api_accepts_non_template_word(api) -> None:
 
 def test_full_topic_script_flow_through_internal_api(api) -> None:
     document = Path("docs/AI行业选题文档上传样例.docx").read_bytes()
-    topic_file_key = upload_file(api, BOSS, document)
+    topic_file_key = upload_file(api, document)
     imported = api.post(
         "/internal/tools/import-topic-document",
         headers=BOSS,
@@ -176,7 +243,7 @@ def test_full_topic_script_flow_through_internal_api(api) -> None:
     mine = api.post("/internal/tools/list-my-tasks", headers=owner_headers, json={})
     assert any(item["task_no"] == task["task_no"] for item in mine.json()["data"])
 
-    script_file_key = upload_file(api, owner_headers, "第一版".encode())
+    script_file_key = upload_file(api, "第一版".encode())
     submitted = api.post(
         "/internal/tools/submit-script-file",
         headers=owner_headers,

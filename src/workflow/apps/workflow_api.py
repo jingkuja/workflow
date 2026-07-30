@@ -3,16 +3,19 @@ from __future__ import annotations
 import json
 import logging
 import secrets
+import tempfile
 import time
 import uuid
 from collections.abc import Iterator
 from contextlib import asynccontextmanager
 from datetime import datetime
+from importlib.resources import files
 from typing import Annotated, Any
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import func, select, text
 from sqlalchemy.orm import Session
@@ -31,7 +34,9 @@ from workflow.db.models import (
 )
 from workflow.db.session import create_engine_from_settings, make_session_factory, session_scope
 from workflow.errors import (
+    FileTooLarge,
     Forbidden,
+    InvalidArgument,
     Unauthenticated,
     WorkflowError,
 )
@@ -71,6 +76,13 @@ app = FastAPI(
     redoc_url=None,
     openapi_url=None,
     lifespan=lifespan,
+)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["null"],
+    allow_credentials=False,
+    allow_methods=["POST"],
+    allow_headers=["Authorization", "Content-Type"],
 )
 
 
@@ -284,6 +296,17 @@ def current_actor(
     return actor
 
 
+def file_upload_access(
+    authorization: Annotated[str | None, Header()] = None,
+) -> None:
+    if not authorization:
+        raise Unauthenticated("缺少文件上传 Bearer Token")
+    scheme, _, token = authorization.partition(" ")
+    expected = settings.file_upload_token.get_secret_value()
+    if scheme.lower() != "bearer" or not token or not secrets.compare_digest(token, expected):
+        raise Unauthenticated("文件上传 Token 无效")
+
+
 def boss_actor(
     actor: Annotated[ActorProfile, Depends(current_actor)],
 ) -> ActorProfile:
@@ -417,6 +440,45 @@ def t1_status(
     return {"success": True, "data": counts}
 
 
+@app.get("/file-upload", response_class=HTMLResponse)
+def file_upload_page() -> str:
+    return files("workflow").joinpath("static/upload-file.html").read_text(encoding="utf-8")
+
+
+@app.post("/api/files/upload")
+async def upload_file(
+    request: Request,
+    _: Annotated[None, Depends(file_upload_access)],
+    session: Annotated[Session, Depends(db_session)],
+) -> dict[str, object]:
+    """Receive a raw binary file and return an unbound temporary file_key."""
+    media_type = request.headers.get("content-type", "").partition(";")[0].strip().lower()
+    if media_type != "application/octet-stream":
+        raise InvalidArgument("Content-Type 必须为 application/octet-stream。")
+
+    max_bytes = t2_service.uploads.max_bytes
+    content_length = request.headers.get("content-length")
+    if content_length:
+        try:
+            declared_size = int(content_length)
+        except ValueError as exc:
+            raise InvalidArgument("Content-Length 格式错误。") from exc
+        if declared_size > max_bytes:
+            raise FileTooLarge(f"文件超过技术上限 {max_bytes} 字节。")
+
+    received = 0
+    with tempfile.TemporaryFile(dir=storage.tmp) as spool:
+        async for chunk in request.stream():
+            received += len(chunk)
+            if received > max_bytes:
+                raise FileTooLarge(f"文件超过技术上限 {max_bytes} 字节。")
+            spool.write(chunk)
+        if received == 0:
+            raise InvalidArgument("文件内容不能为空。")
+        spool.seek(0)
+        return t2_service.uploads.upload_stream(session, stream=spool)
+
+
 @app.get("/files/{opaque_file_id}")
 def download_file(
     opaque_file_id: str,
@@ -535,12 +597,6 @@ class SubmitScriptBody(BaseModel):
     note: str | None = None
 
 
-class UploadFileBody(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    file_base64: str = Field(min_length=1)
-
-
 class PageBody(BaseModel):
     page: int = Field(default=1, ge=1)
     page_size: int = Field(default=50, ge=1, le=100)
@@ -556,18 +612,6 @@ class ReportBlockerBody(BaseModel):
     blocker_type: str
     description: str
     idempotency_key: str
-
-
-@app.post("/internal/tools/upload-file")
-def tool_upload_file(
-    body: UploadFileBody,
-    actor: Annotated[ActorProfile, Depends(current_actor)],
-) -> dict[str, object]:
-    return t2_service.upload_file(
-        actor_name=actor.display_name,
-        role=actor.role,
-        file_base64=body.file_base64,
-    )
 
 
 @app.post("/internal/tools/import-topic-document")

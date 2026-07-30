@@ -25,9 +25,7 @@ def _arbitrary_document() -> bytes:
 def test_structured_import_accepts_arbitrary_word_layout_and_deduplicates(tmp_path) -> None:
     service = make_service(tmp_path)
     content = _arbitrary_document()
-    file_key = upload_file(
-        service, actor_name="老板测试", role="BOSS", content=content
-    )
+    file_key = upload_file(service, content=content)
     topics = [
         StructuredTopicInput(
             source_index="段落 2",
@@ -116,8 +114,6 @@ def test_structured_import_trusts_mcp_content_without_source_verification(tmp_pa
     service = make_service(tmp_path)
     file_key = upload_file(
         service,
-        actor_name="老板测试",
-        role="BOSS",
         content=_arbitrary_document(),
     )
 

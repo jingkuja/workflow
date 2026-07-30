@@ -46,9 +46,7 @@ def make_service(tmp_path: Path) -> T2Service:
 
 def import_sample(service: T2Service) -> list[dict[str, object]]:
     document = Path("docs/AI行业选题文档上传样例.docx").read_bytes()
-    file_key = upload_file(
-        service, actor_name="老板测试", role="BOSS", content=document
-    )
+    file_key = upload_file(service, content=document)
     result = service.import_topics(
         actor_name="老板测试",
         original_filename="选题.docx",
@@ -113,8 +111,6 @@ def test_t4_dashboard_pagination_timeline_and_terminal_state(tmp_path: Path) -> 
     employee_name = str(task["assigned_employee_name"])
     script_file_key = upload_file(
         service,
-        actor_name=employee_name,
-        role="EMPLOYEE",
         content="演播稿".encode(),
     )
     service.submit_script(
@@ -165,8 +161,6 @@ def test_boss_can_cancel_submitted_task_awaiting_review(tmp_path: Path) -> None:
     employee_name = str(task["assigned_employee_name"])
     script_file_key = upload_file(
         service,
-        actor_name=employee_name,
-        role="EMPLOYEE",
         content="待审核演播稿".encode(),
     )
     service.submit_script(

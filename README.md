@@ -6,7 +6,7 @@
 - 老板、员工两个独立的 Streamable HTTP MCP 入口。
 - 固定 Token 鉴权和不同工具白名单。
 - `.docx`、`.pdf`、`.md`、`.txt` 文件字段探针。
-- 最大约 100 MB Base64 视频分块解码与落盘探针。
+- 最大约 100 MB 二进制文件流式上传与落盘。
 - 随机文件 ID 和可点击下载路由。
 - 企业微信群机器人 `userid` @探针，默认禁止真实发送。
 - Docker Compose、Nginx、健康检查、单元测试和联调脚本。
@@ -43,6 +43,8 @@ Nginx 使用 Docker DNS 动态解析 MCP/API 上游，应用容器重建后不�
 
 - 老板 MCP：`http://localhost:8080/mcp/boss`
 - 员工 MCP：`http://localhost:8080/mcp/employee`
+- 文件上传 API：`http://localhost:8080/api/files/upload`
+- 浏览器上传页：`http://localhost:8080/file-upload`
 - 反向代理健康检查：`http://localhost:8080/health`
 - 下载路由：`http://localhost:8080/files/{opaque_file_id}`
 
@@ -52,15 +54,18 @@ Nginx 使用 Docker DNS 动态解析 MCP/API 上游，应用容器重建后不�
 后的值追加到 `MCP_ALLOWED_HOSTS`。服务始终保留 MCP SDK 的 DNS 重绑定保护。
 
 WorkBuddy 应配置完整入口 `/mcp/boss` 或 `/mcp/employee`，不要使用 `/mcp`。
-本地文件统一使用两步工具链：
+MCP 不提供文件上传工具。本地文件统一使用两步链路：
 
-1. 明确调用 `upload_file`。它的 `file_base64` 参数带有
-   `contentEncoding: base64`、`format: byte`，由 MCP Host 读取本地文件并填充，
-   不是模型生成的文本。
-2. 使用返回的 `file_key` 调用 `import_structured_topics`、
-   `import_topic_document` 或 `submit_script_file`。业务工具不再接收 Base64。
+1. 打开 `/file-upload`，或用浏览器打开项目 skill
+   `skill/upload-file-for-mcp/scripts/upload-file.html`，使用固定
+   `FILE_UPLOAD_TOKEN` 上传文件并取得 `file_key`。不需要 Node.js 或 Python。
+2. 使用返回的 `file_key` 调用 `omniq` 或 `jieshi` MCP 的
+   `import_structured_topics`、`import_topic_document` 或 `submit_script_file`。
+   MCP 业务工具不接收文件内容或 Base64。
 
-`file_key` 绑定上传人和公司，默认 24 小时有效；过期后重新调用 `upload_file`。
+上传 API 只验证固定 `FILE_UPLOAD_TOKEN`，不验证人员身份。`file_key` 在首次
+被业务 MCP 使用时才绑定当前调用人和公司，默认 24 小时有效；绑定后其他人员
+不能复用，过期后需重新上传。
 老板上传普通 `.docx` 时应优先调用 `import_structured_topics`：WorkBuddy 负责理解
 文档并生成结构化选题，后台直接保存任务与原文件，并负责去重、分配和审计。
 `import_topic_document` 仅保留给旧的固定标题模板。
@@ -140,9 +145,8 @@ scripts/generate_t0_video.sh t0-artifacts/t0-100mb.mp4
   --video t0-artifacts/t0-100mb.mp4
 ```
 
-Base64 只出现在独立的 `upload_file` 调用中，不再和选题、任务、备注等业务字段
-共享一个工具请求。MCP SDK 和 JSON 解析层仍可能先把完整 Base64 字符串载入
-内存，因此仍需使用真实 WorkBuddy 请求验证单次大文件上传的内存峰值。
+大文件直接通过上传 API 流式发送，不进入 MCP SDK 或 JSON 参数。仍需使用真实
+部署入口验证反向代理超时、磁盘阈值和单次大文件上传的资源峰值。
 
 ## 企业微信验证
 

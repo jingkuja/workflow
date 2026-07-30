@@ -39,7 +39,7 @@ x-mcp-environment: &mcp-environment
   MAX_TOPIC_DOCUMENT_BYTES: ${MAX_TOPIC_DOCUMENT_BYTES:-10485760}
   MAX_SCRIPT_DOCUMENT_BYTES: ${MAX_SCRIPT_DOCUMENT_BYTES:-104857600}
   MAX_VIDEO_BYTES: ${MAX_VIDEO_BYTES:-104857600}
-  MCP_UPLOAD_TTL_HOURS: ${MCP_UPLOAD_TTL_HOURS:-24}
+  FILE_UPLOAD_TTL_HOURS: ${FILE_UPLOAD_TTL_HOURS:-24}
   T0_ALLOW_WECOM_SEND: ${T0_ALLOW_WECOM_SEND:-false}
   WECOM_GROUP_WEBHOOK_URL: ${WECOM_GROUP_WEBHOOK_URL:-}
 
@@ -140,7 +140,7 @@ services:
       interval: 10s
       timeout: 3s
       retries: 5
-    # 本地 100 MB Base64 实测服务端 RSS 约 580 MiB，512 MiB 会有 OOM 风险。
+    # 保留业务工具处理文档所需的内存余量；文件内容不再经过 MCP。
     mem_limit: 1g
 
   employee-mcp:
@@ -190,7 +190,7 @@ services:
       interval: 10s
       timeout: 3s
       retries: 5
-    # 规格 §4.10：workflow-api 上限 1 GB；文档解码与内部转发均在 API 进程执行。
+    # workflow-api 接收流式文件上传并执行文档处理，保留 1 GB 内存上限。
     mem_limit: 1g
 
   workflow-worker:

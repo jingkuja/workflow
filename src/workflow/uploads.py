@@ -1,45 +1,23 @@
 from __future__ import annotations
 
-import base64
-import binascii
 import hashlib
 import uuid
-from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import BinaryIO
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
 from workflow.config import Settings
-from workflow.db.models import ActorProfile, McpFileUpload
+from workflow.db.models import ActorProfile, TemporaryFileUpload
 from workflow.errors import FileProcessingFailed, FileTooLarge, InvalidArgument, ResourceNotFound
-from workflow.storage import LocalStorage
+from workflow.storage import LocalStorage, StoredFile
 from workflow.t2.files import validate_filename, validate_signature
 
-_BASE64_CHUNK_CHARS = 1024 * 1024
 
-
-def _base64_decoded_size(encoded: str) -> int:
-    if len(encoded) % 4:
-        raise InvalidArgument("Base64 内容格式错误。")
-    padding = 2 if encoded.endswith("==") else 1 if encoded.endswith("=") else 0
-    body_end = len(encoded) - padding if padding else len(encoded)
-    if padding > 2 or "=" in encoded[:body_end]:
-        raise InvalidArgument("Base64 内容格式错误。")
-    return len(encoded) // 4 * 3 - padding
-
-
-def _iter_base64_decoded(encoded: str) -> Iterator[bytes]:
-    for offset in range(0, len(encoded), _BASE64_CHUNK_CHARS):
-        yield base64.b64decode(
-            encoded[offset : offset + _BASE64_CHUNK_CHARS],
-            validate=True,
-        )
-
-
-class McpUploadService:
-    """Stores Host-provided Base64 separately and resolves opaque file handles."""
+class TemporaryUploadService:
+    """Store temporary uploads and resolve actor-bound opaque file handles."""
 
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
@@ -53,36 +31,42 @@ class McpUploadService:
             self.settings.max_video_bytes,
         )
 
-    def upload_base64(
+    def upload_stream(
         self,
         session: Session,
         *,
-        actor: ActorProfile,
-        file_base64: str,
+        stream: BinaryIO,
     ) -> dict[str, object]:
-        if file_base64.startswith("data:"):
-            raise InvalidArgument("请传入纯 Base64，不要使用 data URI。")
-        decoded_size = _base64_decoded_size(file_base64)
-        if decoded_size > self.max_bytes:
-            raise FileTooLarge(f"文件超过技术上限 {self.max_bytes} 字节。")
+        """Store an unbound raw binary stream received by the upload API."""
         upload_id = str(uuid.uuid4())
-        try:
-            stored = self.storage.put_chunks(
-                _iter_base64_decoded(file_base64),
-                company_id=actor.company_id,
-                purpose="mcp-upload",
-                attachment_id=upload_id,
-            )
-        except (binascii.Error, ValueError) as exc:
-            raise InvalidArgument("Base64 内容格式错误。") from exc
+        stored = self.storage.put(
+            stream,
+            company_id="unbound",
+            purpose="api-upload",
+            attachment_id=upload_id,
+        )
+        if stored.size_bytes == 0:
+            raise InvalidArgument("文件内容不能为空。")
         if stored.size_bytes > self.max_bytes:
             raise FileTooLarge(f"文件超过技术上限 {self.max_bytes} 字节。")
+        return self._record_upload(
+            session,
+            stored=stored,
+            upload_id=upload_id,
+        )
 
-        expires_at = datetime.now(UTC) + timedelta(hours=self.settings.mcp_upload_ttl_hours)
-        upload = McpFileUpload(
+    def _record_upload(
+        self,
+        session: Session,
+        *,
+        stored: StoredFile,
+        upload_id: str,
+    ) -> dict[str, object]:
+        expires_at = datetime.now(UTC) + timedelta(hours=self.settings.file_upload_ttl_hours)
+        upload = TemporaryFileUpload(
             id=upload_id,
-            company_id=actor.company_id,
-            uploaded_by=actor.id,
+            company_id=None,
+            uploaded_by=None,
             file_key=stored.opaque_file_id,
             storage_provider=stored.storage_provider,
             storage_key=stored.storage_key,
@@ -100,7 +84,7 @@ class McpUploadService:
                 "size_bytes": upload.size_bytes,
                 "expires_at": expires_at.isoformat(),
             },
-            "user_message": "文件已预上传。请把 file_key 传给后续业务工具。",
+            "user_message": "文件已上传但尚未绑定人员。请把 file_key 传给后续业务工具。",
             "next_actions": [
                 {
                     "action": "use_file_key",
@@ -144,19 +128,16 @@ class McpUploadService:
     ) -> Path:
         extension = validate_filename(filename, allowed)
         upload = session.scalar(
-            select(McpFileUpload).where(
-                McpFileUpload.file_key == file_key,
-                McpFileUpload.company_id == actor.company_id,
-                McpFileUpload.uploaded_by == actor.id,
-            )
+            select(TemporaryFileUpload).where(TemporaryFileUpload.file_key == file_key)
         )
         if upload is None:
-            raise ResourceNotFound("file_key 不存在或不属于当前调用人。")
+            raise ResourceNotFound("file_key 不存在。")
         expires_at = upload.expires_at
         if expires_at.tzinfo is None:
             expires_at = expires_at.replace(tzinfo=UTC)
         if expires_at <= datetime.now(UTC):
-            raise ResourceNotFound("file_key 已过期，请重新调用 upload_file。")
+            raise ResourceNotFound("file_key 已过期，请通过文件上传 API 重新上传。")
+        self._claim_or_verify(session, upload=upload, actor=actor)
         if upload.size_bytes > max_bytes:
             raise FileTooLarge(f"文件超过该业务工具的技术上限 {max_bytes} 字节。")
         try:
@@ -176,3 +157,32 @@ class McpUploadService:
             raise FileProcessingFailed("预上传文件完整性校验失败，请重新上传。")
         validate_signature(signature, extension)
         return path
+
+    @staticmethod
+    def _claim_or_verify(
+        session: Session,
+        *,
+        upload: TemporaryFileUpload,
+        actor: ActorProfile,
+    ) -> None:
+        if (upload.company_id is None) != (upload.uploaded_by is None):
+            raise FileProcessingFailed("file_key 归属状态异常。")
+        if upload.company_id is None:
+            claimed = session.execute(
+                update(TemporaryFileUpload)
+                .where(
+                    TemporaryFileUpload.id == upload.id,
+                    TemporaryFileUpload.company_id.is_(None),
+                    TemporaryFileUpload.uploaded_by.is_(None),
+                )
+                .values(company_id=actor.company_id, uploaded_by=actor.id)
+                .execution_options(synchronize_session=False)
+            )
+            if claimed.rowcount == 1:
+                upload.company_id = actor.company_id
+                upload.uploaded_by = actor.id
+            else:
+                session.expire(upload)
+                session.refresh(upload)
+        if upload.company_id != actor.company_id or upload.uploaded_by != actor.id:
+            raise ResourceNotFound("file_key 已由其他调用人绑定。")

@@ -57,7 +57,7 @@ from workflow.t2.calendar import effective_started_at, week_start_for
 from workflow.t2.contracts import StructuredTopicInput
 from workflow.t2.files import DOCUMENT_MIME_TYPES, open_downloaded_document
 from workflow.t2.parser import TopicParseError, parse_topic_document
-from workflow.uploads import McpUploadService
+from workflow.uploads import TemporaryUploadService
 
 TOPIC_EXTENSIONS = {".docx"}
 SCRIPT_EXTENSIONS = {".docx", ".pdf", ".md", ".txt"}
@@ -78,22 +78,7 @@ class T2Service:
         self.engine = create_engine_from_settings(settings)
         self.sessions = make_session_factory(self.engine)
         self.storage = LocalStorage(settings.file_data_dir, settings.disk_reject_percent)
-        self.uploads = McpUploadService(settings)
-
-    def upload_file(
-        self,
-        *,
-        actor_name: str,
-        role: Role,
-        file_base64: str,
-    ) -> dict[str, object]:
-        with session_scope(self.sessions) as session:
-            actor = self._actor(session, actor_name, role)
-            return self.uploads.upload_base64(
-                session,
-                actor=actor,
-                file_base64=file_base64,
-            )
+        self.uploads = TemporaryUploadService(settings)
 
     def import_topics(
         self,

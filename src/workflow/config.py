@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Literal
 from urllib.parse import urlsplit
 
-from pydantic import Field, SecretStr, field_validator, model_validator
+from pydantic import AliasChoices, Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 Role = Literal["BOSS", "EMPLOYEE"]
@@ -59,6 +59,10 @@ class Settings(BaseSettings):
 
     mcp_boss_name: str = "老板测试"
     mcp_boss_token: SecretStr = SecretStr("dev-boss-token-change-me")
+    file_upload_token: SecretStr = Field(
+        default=SecretStr("dev-file-upload-token-change-me"),
+        min_length=16,
+    )
     mcp_boss_wecom_userid: str = ""
     mcp_employees_json: str = (
         '[{"name":"员工测试","token":"dev-employee-token-change-me",'
@@ -68,7 +72,16 @@ class Settings(BaseSettings):
     max_topic_document_bytes: int = Field(default=10 * 1024 * 1024, gt=0)
     max_script_document_bytes: int = Field(default=100 * 1024 * 1024, gt=0)
     max_video_bytes: int = Field(default=100 * 1024 * 1024, gt=0)
-    mcp_upload_ttl_hours: int = Field(default=24, ge=1, le=168)
+    file_upload_ttl_hours: int = Field(
+        default=24,
+        ge=1,
+        le=168,
+        validation_alias=AliasChoices(
+            "file_upload_ttl_hours",
+            "FILE_UPLOAD_TTL_HOURS",
+            "MCP_UPLOAD_TTL_HOURS",
+        ),
+    )
 
     t0_allow_wecom_send: bool = False
     wecom_group_webhook_url: SecretStr | None = None

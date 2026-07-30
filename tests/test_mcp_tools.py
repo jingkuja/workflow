@@ -39,8 +39,8 @@ def test_boss_and_employee_tool_whitelists_are_isolated(tmp_path: Path) -> None:
     boss_tools = tool_names(boss_server)
     employee_tools = tool_names(employee_server)
 
-    assert "upload_file" in boss_tools
-    assert "upload_file" in employee_tools
+    assert "upload_file" not in boss_tools
+    assert "upload_file" not in employee_tools
     assert "t0_boss_capability" in boss_tools
     assert "t0_employee_capability" not in boss_tools
     assert "t0_employee_capability" in employee_tools
@@ -60,11 +60,6 @@ def test_boss_and_employee_tool_whitelists_are_isolated(tmp_path: Path) -> None:
     assert "import_topic_document" not in employee_tools
     assert "import_structured_topics" not in employee_tools
     assert "change_task_assignee" not in employee_tools
-
-    upload_input = tool_parameters(boss_server, "upload_file")["file_base64"]
-    assert upload_input["contentEncoding"] == "base64"
-    assert upload_input["contentMediaType"] == "application/octet-stream"
-    assert upload_input["format"] == "byte"
 
     for server, tool_name in (
         (boss_server, "import_topic_document"),

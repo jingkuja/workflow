@@ -170,11 +170,13 @@ class Attachment(TimestampMixin, Base):
     )
 
 
-class McpFileUpload(Base):
-    """MCP Host 预上传的临时文件。
+class TemporaryFileUpload(Base):
+    """后台上传 API 创建的临时文件。
 
-    file_key 只是句柄，不是 bearer capability；消费时仍按 company_id 和
-    uploaded_by 校验当前调用人，避免跨人员复用。
+    上传阶段不绑定公司或人员。file_key 首次被业务工具消费时原子绑定当前调用人
+    和公司，随后拒绝其他人员复用。
+
+    物理表名为兼容已发布迁移而保留。
     """
 
     __tablename__ = "mcp_file_uploads"
@@ -183,10 +185,8 @@ class McpFileUpload(Base):
     )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
-    company_id: Mapped[str] = mapped_column(String(64), nullable=False)
-    uploaded_by: Mapped[str] = mapped_column(
-        ForeignKey("actor_profiles.id"), nullable=False
-    )
+    company_id: Mapped[str | None] = mapped_column(String(64))
+    uploaded_by: Mapped[str | None] = mapped_column(ForeignKey("actor_profiles.id"))
     file_key: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
     storage_provider: Mapped[str] = mapped_column(
         String(32), default="LOCAL", nullable=False

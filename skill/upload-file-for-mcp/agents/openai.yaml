@@ -1,4 +1,0 @@
-interface:
-  display_name: "文件上传（MCP 前置）"
-  short_description: "执行 Python 脚本上传文件并将 file_key 交给业务 MCP"
-  default_prompt: "使用 $upload-file-for-mcp 上传本地文件取得 file_key，然后通过 omniq 或 jieshi MCP 完成业务任务。"

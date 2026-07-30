@@ -47,8 +47,8 @@ def test_boss_and_employee_tool_whitelists_are_isolated(tmp_path: Path) -> None:
     assert "t0_boss_capability" not in employee_tools
     assert "t0_probe_wecom_mention" in boss_tools
     assert "t0_probe_wecom_mention" not in employee_tools
-    assert "import_topic_document" in boss_tools
-    assert "import_structured_topics" in boss_tools
+    assert "import_topic_document" not in boss_tools
+    assert "import_structured_topics" not in boss_tools
     assert "change_task_assignee" in boss_tools
     assert "review_script_submission" in boss_tools
     assert "get_workflow_dashboard" in boss_tools
@@ -61,11 +61,7 @@ def test_boss_and_employee_tool_whitelists_are_isolated(tmp_path: Path) -> None:
     assert "import_structured_topics" not in employee_tools
     assert "change_task_assignee" not in employee_tools
 
-    for server, tool_name in (
-        (boss_server, "import_topic_document"),
-        (boss_server, "import_structured_topics"),
-        (employee_server, "submit_script_file"),
-    ):
+    for server, tool_name in ((employee_server, "submit_script_file"),):
         parameters = tool_parameters(server, tool_name)
         assert "file_key" in parameters
         assert all("base64" not in name for name in parameters)

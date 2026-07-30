@@ -1,0 +1,4 @@
+interface:
+  display_name: "Boss 选题导入"
+  short_description: "上传 Word 并通过 REST 结构化导入选题任务"
+  default_prompt: "使用 $boss 读取并预览本地 Word 选题，确认后通过随附脚本直接导入任务。"

@@ -10,7 +10,6 @@ from workflow.apps.api_client import WorkflowApiClient
 from workflow.config import Role, Settings
 from workflow.probes.service import ProbeService
 from workflow.probes.wecom import send_wecom_probe
-from workflow.t2.contracts import StructuredTopicInput
 
 
 @dataclass(frozen=True, slots=True)
@@ -68,70 +67,6 @@ def create_mcp_server(settings: Settings, role: Role) -> FastMCP:
         return service.get_probe_file(opaque_file_id).model_dump()
 
     if role == "BOSS":
-
-        @mcp.tool(
-            name="import_topic_document",
-            description=(
-                "导入 .docx 选题并自动均衡分配。已弃用。"
-                "本地文件必须先通过后台文件上传 API 取得 file_key，再传入本工具。"
-            ),
-        )
-        def import_topic_document(
-            original_filename: str,
-            idempotency_key: str,
-            context: Context,
-            file_key: str | None = None,
-            file_url: str | None = None,
-        ) -> dict[str, Any]:
-            return api.call(
-                "/internal/tools/import-topic-document",
-                token=_caller(context).token,
-                tool="import_topic_document",
-                payload={
-                    "original_filename": original_filename,
-                    "idempotency_key": idempotency_key,
-                    "file_key": file_key,
-                    "file_url": file_url,
-                },
-            )
-
-        @mcp.tool(
-            name="import_structured_topics",
-            description=(
-                "推荐的选题导入入口。先用 WorkBuddy 大模型阅读任意排版的 .docx，"
-                "向老板展示提取预览并确认后调用。title 可概括；source_text、script "
-                "和 evidence 由 WorkBuddy 生成，缺少成稿时 script 传 null。"
-                "服务信任 MCP 结果并直接入库，同时保存源文件、去重并自动均衡分配。"
-                "调用完成后必须以工具返回的 created_count、deduplicated 和 tasks 为准，"
-                "不得用调用前 topics 数量自行宣称导入成功。"
-                "本地 Word 必须先通过后台文件上传 API 取得 file_key；"
-                "本工具不接收文件内容。"
-            ),
-        )
-        def import_structured_topics(
-            original_filename: str,
-            topics: list[StructuredTopicInput],
-            idempotency_key: str,
-            context: Context,
-            file_key: str | None = None,
-            file_url: str | None = None,
-            warnings: list[str] | None = None,
-            schema_version: str = "1.0",
-        ) -> dict[str, Any]:
-            return api.call(
-                "/internal/tools/import-structured-topics",
-                token=_caller(context).token,
-                tool="import_structured_topics",
-                payload={
-                    "original_filename": original_filename,
-                    "topics": [topic.model_dump(mode="json") for topic in topics],
-                    "warnings": warnings or [],
-                    "schema_version": schema_version,
-                    "idempotency_key": idempotency_key,
-                    "file_key": file_key,
-                    "file_url": file_url,
-                },
-            )
 
         @mcp.tool(name="list_import_batch_tasks", description="查询导入批次的最新任务列表。")
         def list_import_batch_tasks(import_batch_id: str, context: Context) -> dict[str, Any]:

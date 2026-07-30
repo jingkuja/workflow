@@ -153,9 +153,7 @@ def test_standalone_file_upload_api_contract(api) -> None:
     page = api.get("/file-upload")
     assert page.status_code == 200
     assert "不需要安装 Node.js 或 Python" in page.text
-    assert page.text == Path(
-        "skill/upload-file-for-mcp/scripts/upload-file.html"
-    ).read_text()
+    assert page.text == Path("src/workflow/static/upload-file.html").read_text()
 
     preflight = api.options(
         "/api/files/upload",
@@ -197,6 +195,26 @@ def test_structured_topic_import_api_accepts_non_template_word(api) -> None:
     assert imported.status_code == 200
     assert imported.json()["data"]["import_mode"] == "WORKBUDDY_STRUCTURED"
     assert imported.json()["data"]["created_count"] == 1
+
+    public_body = {
+        **body,
+        "idempotency_key": "api-structured-public-0001",
+    }
+    public_import = api.post(
+        "/api/topics/import-structured",
+        headers=BOSS,
+        json=public_body,
+    )
+    assert public_import.status_code == 200
+    assert public_import.json()["data"]["deduplicated"] is True
+    assert public_import.json()["data"]["created_count"] == 0
+
+    public_forbidden = api.post(
+        "/api/topics/import-structured",
+        headers=EMP_A,
+        json=public_body,
+    )
+    assert public_forbidden.status_code == 403
 
     legacy_body = {**body, "content_base64": "ZmlsZQ=="}
     legacy_body.pop("file_key")

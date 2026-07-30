@@ -479,6 +479,32 @@ async def upload_file(
         return t2_service.uploads.upload_stream(session, stream=spool)
 
 
+def _import_structured_topics(
+    body: StructuredTopicImportBody,
+    actor: ActorProfile,
+) -> dict[str, Any]:
+    """Route both REST and legacy internal callers through one business operation."""
+    return t2_service.import_structured_topics(
+        actor_name=actor.display_name,
+        original_filename=body.original_filename,
+        idempotency_key=body.idempotency_key,
+        topics=body.topics,
+        warnings=body.warnings,
+        schema_version=body.schema_version,
+        file_key=body.file_key,
+        file_url=body.file_url,
+    )
+
+
+@app.post("/api/topics/import-structured")
+def import_structured_topics_api(
+    body: StructuredTopicImportBody,
+    actor: Annotated[ActorProfile, Depends(boss_actor)],
+) -> dict[str, Any]:
+    """Import model-extracted topics directly from the boss-local skill."""
+    return _import_structured_topics(body, actor)
+
+
 @app.get("/files/{opaque_file_id}")
 def download_file(
     opaque_file_id: str,
@@ -633,16 +659,7 @@ def tool_import_structured_topics(
     body: StructuredTopicImportBody,
     actor: Annotated[ActorProfile, Depends(boss_actor)],
 ) -> dict[str, Any]:
-    return t2_service.import_structured_topics(
-        actor_name=actor.display_name,
-        original_filename=body.original_filename,
-        idempotency_key=body.idempotency_key,
-        topics=body.topics,
-        warnings=body.warnings,
-        schema_version=body.schema_version,
-        file_key=body.file_key,
-        file_url=body.file_url,
-    )
+    return _import_structured_topics(body, actor)
 
 
 @app.post("/internal/tools/list-import-batch-tasks")

@@ -16,7 +16,7 @@
 - 企业微信事务发件箱及事件去重、重试和 DEAD 状态。
 - `storage_provider + storage_key` 附件模型、本地原子落盘和磁盘阈值保护。
 - 数据库备份、隔离恢复脚本和 Docker 日志轮转。
-- WorkBuddy 大模型结构化抽取任意排版 Word，后台信任 MCP 结果、保存原文件，并按“文件 + 任务内容”去重入库。
+- WorkBuddy 大模型结构化抽取任意排版 Word，老板本地 skill 通过 REST 导入，后台保存原文件并按文件哈希去重入库。
 - 工作日生效规则、任务编号和按周工作量最小值随机分配。
 - 导入任务删除、改派、优先级以及老板/员工资源权限隔离；只有老板可以指派或改派，员工不能把任务指派给其他人。
 - `.docx`、`.pdf`、`.md`、`.txt` 演播稿多版本提交、驳回、重提和通过。
@@ -44,6 +44,7 @@ Nginx 使用 Docker DNS 动态解析 MCP/API 上游，应用容器重建后不�
 - 老板 MCP：`http://localhost:8080/mcp/boss`
 - 员工 MCP：`http://localhost:8080/mcp/employee`
 - 文件上传 API：`http://localhost:8080/api/files/upload`
+- 结构化选题导入 API：`http://localhost:8080/api/topics/import-structured`
 - 浏览器上传页：`http://localhost:8080/file-upload`
 - 反向代理健康检查：`http://localhost:8080/health`
 - 下载路由：`http://localhost:8080/files/{opaque_file_id}`
@@ -54,21 +55,18 @@ Nginx 使用 Docker DNS 动态解析 MCP/API 上游，应用容器重建后不�
 后的值追加到 `MCP_ALLOWED_HOSTS`。服务始终保留 MCP SDK 的 DNS 重绑定保护。
 
 WorkBuddy 应配置完整入口 `/mcp/boss` 或 `/mcp/employee`，不要使用 `/mcp`。
-MCP 不提供文件上传工具。本地文件统一使用两步链路：
-
-1. 打开 `/file-upload`，或用浏览器打开项目 skill
-   `skill/upload-file-for-mcp/scripts/upload-file.html`，使用固定
-   `FILE_UPLOAD_TOKEN` 上传文件并取得 `file_key`。不需要 Node.js 或 Python。
-2. 使用返回的 `file_key` 调用 `omniq` 或 `jieshi` MCP 的
-   `import_structured_topics`、`import_topic_document` 或 `submit_script_file`。
-   MCP 业务工具不接收文件内容或 Base64。
+MCP 不提供文件上传工具。老板安装 `skill/boss`，读取并预览 Word 后运行
+`scripts/import_topics.py`；脚本先调用 `/api/files/upload`，再直接调用
+`/api/topics/import-structured`，不经过 MCP。员工安装 `skill/js`，运行
+`scripts/upload_file.py` 取得 `file_key` 后再调用 jieshi MCP 的
+`submit_script_file`。MCP 业务工具不接收文件内容或 Base64。
 
 上传 API 只验证固定 `FILE_UPLOAD_TOKEN`，不验证人员身份。`file_key` 在首次
 被业务 MCP 使用时才绑定当前调用人和公司，默认 24 小时有效；绑定后其他人员
 不能复用，过期后需重新上传。
-老板上传普通 `.docx` 时应优先调用 `import_structured_topics`：WorkBuddy 负责理解
-文档并生成结构化选题，后台直接保存任务与原文件，并负责去重、分配和审计。
-`import_topic_document` 仅保留给旧的固定标题模板。
+老板 MCP 不再暴露 `import_topic_document` 和 `import_structured_topics`。老板本地
+`boss` skill 负责理解文档、生成结构化选题并调用 REST 导入；后台保存任务与原文件，
+并负责去重、分配和审计。
 
 ## 开发与测试
 

@@ -1,0 +1,4 @@
+interface:
+  display_name: "JS 员工文件上传"
+  short_description: "使用本地脚本上传员工任务文件并交给 jieshi MCP 提交"
+  default_prompt: "使用 $js 上传本地演播稿文件，再通过 jieshi MCP 提交到对应任务。"

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Upload one local file and print the returned file_key as JSON."""
+"""Upload one boss-local file and print the returned file_key as JSON."""
 
 from __future__ import annotations
 
@@ -20,7 +20,7 @@ CHUNK_SIZE = 1024 * 1024
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="上传本地文件并输出供 omniq 或 jieshi MCP 使用的 file_key。"
+        description="上传老板本地文件并输出供工作流 REST API 使用的 file_key。"
     )
     parser.add_argument("file", type=Path, help="要上传的本地文件路径")
     parser.add_argument(
@@ -63,8 +63,7 @@ def upload_file(
     if target.scheme == "https":
         connection_kwargs["context"] = ssl.create_default_context()
 
-    port = target.port
-    connection = connection_class(target.hostname, port=port, **connection_kwargs)
+    connection = connection_class(target.hostname, port=target.port, **connection_kwargs)
     request_target = target.path or "/"
     if target.query:
         request_target += f"?{target.query}"
@@ -82,19 +81,18 @@ def upload_file(
 
         response = connection.getresponse()
         raw_body = response.read()
+        status = response.status
     finally:
         connection.close()
 
     try:
         payload = json.loads(raw_body.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise RuntimeError(
-            f"上传接口返回了无效 JSON（HTTP {response.status}）。"
-        ) from exc
+        raise RuntimeError(f"上传接口返回了无效 JSON（HTTP {status}）。") from exc
 
-    if response.status < 200 or response.status >= 300 or payload.get("success") is False:
+    if status < 200 or status >= 300 or payload.get("success") is False:
         message = payload.get("error", {}).get("message") or payload
-        raise RuntimeError(f"上传失败（HTTP {response.status}）：{message}")
+        raise RuntimeError(f"上传失败（HTTP {status}）：{message}")
 
     data = payload.get("data", payload)
     file_key = data.get("file_key")

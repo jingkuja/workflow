@@ -9,7 +9,7 @@ description: 在老板本地读取任意排版的 Word 选题文档，预览并�
 
 ## 固定配置
 
-- 服务地址：`https://feishu.todoucloud.com`
+- 服务地址：`https://aiflow.todoucloud.com`
 - 文件上传 Token：`dev-file-upload-token-change-me`
 - 老板导入 Token：`dev-boss-token-change-me`
 - 上传接口：`/api/files/upload`

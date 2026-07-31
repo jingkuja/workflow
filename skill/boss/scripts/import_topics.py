@@ -15,7 +15,7 @@ from urllib.request import Request, urlopen
 
 from upload_file import upload_file
 
-DEFAULT_BASE_URL = "https://feishu.todoucloud.com"
+DEFAULT_BASE_URL = "https://aiflow.todoucloud.com"
 DEFAULT_UPLOAD_TOKEN = "dev-file-upload-token-change-me"
 DEFAULT_BOSS_TOKEN = "dev-boss-token-change-me"
 

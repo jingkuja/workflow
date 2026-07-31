@@ -12,7 +12,7 @@ MCP 参数。
 
 固定配置如下：
 
-- 上传接口：`https://feishu.todoucloud.com/api/files/upload`
+- 上传接口：`https://aiflow.todoucloud.com/api/files/upload`
 - 上传 Token：`dev-file-upload-token-change-me`
 
 以本 `SKILL.md` 所在目录为基准解析脚本绝对路径，并实际执行：
@@ -47,6 +47,6 @@ py "C:\absolute\path\to\js\scripts\upload_file.py" "C:\absolute\path\to\file"
 ## 浏览器备用方式
 
 当 Python 方式不可用时，打开
-`https://feishu.todoucloud.com/file-upload`，或用现代浏览器打开
+`https://aiflow.todoucloud.com/file-upload`，或用现代浏览器打开
 [scripts/upload-file.html](scripts/upload-file.html) 并填写完整上传端点。由
 用户选择文件并上传。

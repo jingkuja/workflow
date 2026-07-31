@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
-DEFAULT_ENDPOINT = "https://feishu.todoucloud.com/api/files/upload"
+DEFAULT_ENDPOINT = "https://aiflow.todoucloud.com/api/files/upload"
 DEFAULT_TOKEN = "dev-file-upload-token-change-me"
 CHUNK_SIZE = 1024 * 1024
 
